@@ -6,8 +6,9 @@ import importlib.util
 import json
 from pathlib import Path
 from typing import Any
+import yaml
 
-from nonebot import get_plugin_config, logger
+from nonebot import logger
 from nonebot.compat import PYDANTIC_V2
 from pydantic import BaseModel, Field
 
@@ -88,8 +89,11 @@ class MCQQConfig(BaseModel):
     display_server_name: bool = False
     """是否发送服务器名称"""
 
-    say_way: str = "："
+    say_way: str = " "
     """用户发言修饰"""
+
+    username_way: list[str] = ["<",">"]
+    """用户名修饰"""
 
     server_dict: dict[str, Server] = Field(default_factory=dict)
     """服务器配置"""
@@ -196,7 +200,39 @@ class Config(BaseModel):
     mc_qq: MCQQConfig = MCQQConfig()
 
 
-plugin_config = get_plugin_config(Config).mc_qq
+config_path = Path("config/mc_qq.yaml")
+if not config_path.parent.exists():
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+if not config_path.exists():
+    alt_path = Path("mc_qq.yaml")
+    if alt_path.exists():
+        config_path = alt_path
+    else:
+        try:
+            import json
+            if PYDANTIC_V2:
+                default_data = json.loads(MCQQConfig().model_dump_json())
+            else:
+                default_data = json.loads(MCQQConfig().json())
+            with open(config_path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(default_data, f, allow_unicode=True, sort_keys=False)
+            logger.info(f"MCQQ 插件已在 {config_path} 自动生成默认配置文件")
+        except Exception as e:
+            logger.error(f"生成默认配置文件失败：{e}")
+
+plugin_config = MCQQConfig()
+if config_path.exists():
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            yaml_data = yaml.safe_load(f) or {}
+        if PYDANTIC_V2:
+            plugin_config = MCQQConfig.model_validate(yaml_data)
+        else:
+            plugin_config = MCQQConfig.parse_obj(yaml_data)
+        logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
+    except Exception as e:
+        logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
 
 if plugin_config.ignore_word_list:
     IGNORE_WORD_LIST.add(*plugin_config.ignore_word_list)
