@@ -148,5 +148,4 @@ tests/
 #font
 
 LOCAL_APPDATA_FONTCONFIG_CACHE/
-*.ttf
 fonts.conf
