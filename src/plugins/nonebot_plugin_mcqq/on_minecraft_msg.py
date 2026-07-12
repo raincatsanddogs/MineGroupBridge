@@ -11,9 +11,9 @@ from .config import plugin_config
 from .utils.rule import mc_msg_rule
 from .utils.send_to_qq import send_mc_msg_to_qq
 
-require("minecraft_achievement_render")
+require("src.plugins.minecraft_achievement_render")
 
-from minecraft_achievement_render import render_achievement_to_bytes
+from src.plugins.minecraft_achievement_render import render_achievement_to_bytes
 
 on_mc_msg = on_message(priority=5, rule=mc_msg_rule)
 
