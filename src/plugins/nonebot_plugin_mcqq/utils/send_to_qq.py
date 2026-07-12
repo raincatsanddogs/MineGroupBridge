@@ -1,38 +1,60 @@
 import re
 
 from nonebot import get_bot, logger
+
 from nonebot.adapters.onebot.v11 import Bot as OneBot
+from nonebot.adapters.onebot.v11 import Message as OneBotMessage
+from nonebot.adapters.onebot.v11 import MessageSegment as OneBotMessageSegment
+
 from nonebot.adapters.qq import AuditException
 from nonebot.adapters.qq import Bot as QQBot
+from nonebot.adapters.qq import Message as QQMessage
+from nonebot.adapters.qq import MessageSegment as QQMessageSegment
 
 from ..config import plugin_config
 
 
-async def send_mc_msg_to_qq(server_name: str, result: str):
+async def send_mc_msg_to_qq(server_name: str, result: str, img_bytes: bytes | None = None):
     msg_result = re.sub(r"[&§].", "", result)
     if server := plugin_config.server_dict.get(server_name):
         if plugin_config.display_server_name:
             msg_result = f"[{server_name}] {msg_result}"
 
         for group in server.group_list:
-            if bot := __get_target_bot(group.bot_id, True, group.group_id, msg_result):
+            if bot := __get_target_bot(group.bot_id, True, group.group_id, msg_result or "[图片消息]"):
                 if group.adapter == "onebot" and isinstance(bot, OneBot):
                     try:
+                        if img_bytes:
+                            msg = OneBotMessage()
+                            if msg_result:
+                                msg += OneBotMessageSegment.text(msg_result)
+                            msg += OneBotMessageSegment.image(img_bytes)
+                        else:
+                            msg = msg_result
                         await bot.send_group_msg(
-                            group_id=int(group.group_id), message=msg_result
+                            group_id=int(group.group_id), message=msg
                         )
                     except Exception as e:
                         logger.error(
-                            f"[MC_QQ]丨发送至 OneBot Group {group.group_id} 的消息：{msg_result} 出现异常：{e!r}"
+                            f"[MC_QQ]丨发送至 OneBot Group {group.group_id} 的消息出现异常：{e!r}"
                         )
                 elif group.adapter == "qq" and isinstance(bot, QQBot):
                     try:
-                        await bot.post_group_messages(
-                            group_openid=group.group_id, msg_type=0, content=msg_result
-                        )
+                        if img_bytes:
+                            msg = QQMessage()
+                            if msg_result:
+                                msg += QQMessageSegment.text(msg_result)
+                            msg += QQMessageSegment.file_image(img_bytes)
+                            await bot.send_to_group(
+                                group_openid=group.group_id, message=msg
+                            )
+                        else:
+                            await bot.post_group_messages(
+                                group_openid=group.group_id, msg_type=0, content=msg_result
+                            )
                     except AuditException as e:
                         logger.debug(
-                            f"[MC_QQ]丨发送至 QQ Group {group.group_id} 的消息：{msg_result} 正在审核中"
+                            f"[MC_QQ]丨发送至 QQ Group {group.group_id} 的消息正在审核中"
                         )
                         try:
                             audit_result = await e.get_audit_result(3)
@@ -45,14 +67,14 @@ async def send_mc_msg_to_qq(server_name: str, result: str):
                             )
                     except Exception as e:
                         logger.error(
-                            f"[MC_QQ]丨发送至 QQ Group {group.group_id} 的消息：{msg_result} 出现异常：{e!r}"
+                            f"[MC_QQ]丨发送至 QQ Group {group.group_id} 的消息出现异常：{e!r}"
                         )
                 else:
                     logger.error(f"[MC_QQ]丨未知的适配器: {group.adapter}")
 
         for guild in server.guild_list:
             if bot := __get_target_bot(
-                guild.bot_id, False, guild.channel_id, msg_result
+                guild.bot_id, False, guild.channel_id, msg_result or "[图片消息]"
             ):
                 # if guild.adapter == "onebot":
                 #     assert isinstance(bot, OneBot)
@@ -63,12 +85,19 @@ async def send_mc_msg_to_qq(server_name: str, result: str):
                 #     )
                 if guild.adapter == "qq" and isinstance(bot, QQBot):
                     try:
+                        if img_bytes:
+                            msg = QQMessage()
+                            if msg_result:
+                                msg += QQMessageSegment.text(msg_result)
+                            msg += QQMessageSegment.file_image(img_bytes)
+                        else:
+                            msg = msg_result
                         await bot.send_to_channel(
-                            channel_id=guild.channel_id, message=msg_result
+                            channel_id=guild.channel_id, message=msg
                         )
                     except AuditException as e:
                         logger.debug(
-                            f"[MC_QQ]丨发送至 QQ Channel {guild.channel_id} 的消息：{msg_result} 正在审核中"
+                            f"[MC_QQ]丨发送至 QQ Channel {guild.channel_id} 的消息正在审核中"
                         )
                         try:
                             audit_result = await e.get_audit_result(3)
@@ -81,7 +110,7 @@ async def send_mc_msg_to_qq(server_name: str, result: str):
                             )
                     except Exception as e:
                         logger.error(
-                            f"[MC_QQ]丨发送至 QQ Channel {guild.channel_id} 的消息：{msg_result} 出现异常：{e!r}"
+                            f"[MC_QQ]丨发送至 QQ Channel {guild.channel_id} 的消息出现异常：{e!r}"
                         )
     else:
         logger.error(f"未知的服务器: {server_name}")
