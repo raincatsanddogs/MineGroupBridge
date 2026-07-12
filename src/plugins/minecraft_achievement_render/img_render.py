@@ -15,12 +15,17 @@ from config import plugin_config
 
 
 async def render_achievement_to_bytes(
-        title: str,
-        description: str,
-        achi_type: str,
-        key: str,
-        res_path_prefix: str = plugin_config.res_path_prefix
+        title: str | None,
+        description: str | None,
+        achi_type: str | None = "task",
+        key: str | None = "minecraft:story/root",
+        res_path_prefix: str = plugin_config.res_path_prefix,
     ) -> bytes:
+
+    title = title or "未知成就"
+    description = description or "暂无描述"
+    achi_type = achi_type or "task"
+    key = key or "minecraft:story/root"
 
     png_path = await get_resource_path(key , res_path_prefix)
 

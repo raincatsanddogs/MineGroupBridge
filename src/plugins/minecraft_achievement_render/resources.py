@@ -5,13 +5,15 @@ file_path = str(Path(__file__).parent / "templates") + "/advancements.json"
 with open(file_path, encoding="utf-8") as f:
     advancements = json.load(f)
 
-async def get_resource_path(key: str, prefix: str) -> str:
+async def get_resource_path(key: str, prefix: str) -> str | None:
     """
     获取资源文件的路径
     :param key: 资源文件的键
     :param prefix: 资源文件的前缀
     :return: 资源文件的路径
     """
+    if key == None:
+        return None
 
     try:
         target_key = advancements[key]["icon"]["id"]

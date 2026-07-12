@@ -80,6 +80,9 @@ class MCQQConfig(BaseModel):
     rcon_result_to_image: bool = False
     """是否将 Rcon 命令执行结果转换为图片"""
 
+    achievement_to_image: bool = True
+    """是否将成就消息转换为图片"""
+
     ttf_path: Path = Path(__file__).parent / "resource" / "unifont-15.0.01.ttf"
     """字体路径"""
 
@@ -222,17 +225,44 @@ if not config_path.exists():
             logger.error(f"生成默认配置文件失败：{e}")
 
 plugin_config = MCQQConfig()
-if config_path.exists():
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            yaml_data = yaml.safe_load(f) or {}
-        if PYDANTIC_V2:
-            plugin_config = MCQQConfig.model_validate(yaml_data)
-        else:
-            plugin_config = MCQQConfig.parse_obj(yaml_data)
-        logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
-    except Exception as e:
-        logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
+loaded_from_nonebot = False
+try:
+    from nonebot import get_driver
+    driver = get_driver()
+    mc_qq_raw = getattr(driver.config, "mc_qq", None)
+    if mc_qq_raw:
+        if isinstance(mc_qq_raw, dict):
+            if PYDANTIC_V2:
+                plugin_config = MCQQConfig.model_validate(mc_qq_raw)
+            else:
+                plugin_config = MCQQConfig.parse_obj(mc_qq_raw)
+            loaded_from_nonebot = True
+        elif isinstance(mc_qq_raw, MCQQConfig):
+            plugin_config = mc_qq_raw
+            loaded_from_nonebot = True
+        elif hasattr(mc_qq_raw, "model_dump"):
+            plugin_config = MCQQConfig.model_validate(mc_qq_raw.model_dump())
+            loaded_from_nonebot = True
+        elif hasattr(mc_qq_raw, "dict"):
+            plugin_config = MCQQConfig.parse_obj(mc_qq_raw.dict())
+            loaded_from_nonebot = True
+        if loaded_from_nonebot:
+            logger.info("MCQQ 插件成功从 NoneBot 配置加载 mc_qq 项")
+except Exception as e:
+    logger.debug(f"从 NoneBot 配置加载 mc_qq 失败：{e}")
+
+if not loaded_from_nonebot:
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                yaml_data = yaml.safe_load(f) or {}
+            if PYDANTIC_V2:
+                plugin_config = MCQQConfig.model_validate(yaml_data)
+            else:
+                plugin_config = MCQQConfig.parse_obj(yaml_data)
+            logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
+        except Exception as e:
+            logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
 
 if plugin_config.ignore_word_list:
     IGNORE_WORD_LIST.add(*plugin_config.ignore_word_list)
