@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import font_loader
+from . import font_loader
 from nonebot import require
 
 TEMPLATE_DIR_PATH = Path(__file__).parent / "templates"
@@ -9,9 +9,9 @@ TEMPLATE_DIR = str(TEMPLATE_DIR_PATH)
 require("nonebot_plugin_htmlkit")
 
 from nonebot_plugin_htmlkit import template_to_pic
-from resources import get_resource_path
+from .resources import get_resource_path
 
-from config import plugin_config
+from .config import plugin_config
 
 
 async def render_achievement_to_bytes(
