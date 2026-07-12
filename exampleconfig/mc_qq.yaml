@@ -1,0 +1,29 @@
+command_header:
+  - mcc
+ignore_word_file: "./src/mc_qq_ignore_word_list.json"
+command_priority: 98
+command_block: true
+notice_connected: false
+rcon_result_to_image: false
+ttf_path: null
+send_group_name: false
+display_server_name: false
+say_way: " "
+username_way: ["<",">"]
+guild_admin_roles:
+  - 频道主
+  - 超级管理员
+chat_image_enable: false
+cmd_whitelist:
+  - list
+  - tps
+  - banlist
+# 群服互联的核心映射配置
+server_dict:
+  "my_minecraft_server":
+    group_list:
+      - group_id: "123456789" # QQ群号
+        adapter: "onebot"    # 适配器名称
+        bot_id: "987654321"   # 机器人QQ号
+    guild_list: []
+    rcon_msg: false
