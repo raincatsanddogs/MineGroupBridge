@@ -25,7 +25,11 @@ async def handle_mc_msg(event: PlayerChatEvent):
     message_text = str(event.message)
     if message_text.startswith("!!"):
         return
-    msg_text = event.player.nickname + plugin_config.say_way + message_text
+    username_way = plugin_config.username_way
+    prefix = username_way[0] if len(username_way) > 0 else ""
+    suffix = username_way[1] if len(username_way) > 1 else ""
+    formatted_nickname = f"{prefix}{event.player.nickname}{suffix}"
+    msg_text = formatted_nickname + plugin_config.say_way + message_text
     await send_mc_msg_to_qq(event.server_name, msg_text)
 
 
