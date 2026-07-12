@@ -68,10 +68,10 @@ async def handle_mc_otherevent(event: PlayerAchievementEvent):
             display = achievement.display
             if display:
                 achi_frame = display.frame
-                if display.title and display.title.translate:
-                    achi_title = display.title.translate.text
-                if display.description and display.description.translate:
-                    achi_desc = display.description.translate.text
+                if display.title and display.title.text:
+                    achi_title = display.title.text
+                if display.description and display.description.text:
+                    achi_desc = display.description.text
 
         any_none = (
             achi_title is None
