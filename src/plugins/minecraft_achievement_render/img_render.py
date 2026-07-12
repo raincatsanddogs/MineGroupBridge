@@ -37,6 +37,7 @@ async def render_achievement_to_bytes(
     }
 
     img_bytes = await template_to_pic(
+        max_width = 1980,
         template_path = TEMPLATE_DIR,
         template_name = "achievement.html",
         templates = template_vars,
