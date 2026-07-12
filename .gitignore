@@ -143,8 +143,9 @@ dmypy.json
 #config
 config/
 
+#?
 tests/
-
+.vscode/
 #font
 
 LOCAL_APPDATA_FONTCONFIG_CACHE/
