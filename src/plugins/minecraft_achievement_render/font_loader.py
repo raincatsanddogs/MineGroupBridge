@@ -14,8 +14,8 @@ if FONT_PATH.exists():
     fonts_conf_content = f"""<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
-    <dir>{TEMPLATE_DIR_PATH.as_posix()}</dir>
-    <dir>{win_fonts.as_posix()}</dir>
+    <dir>{TEMPLATE_DIR_PATH.resolve().as_posix()}</dir>
+    <dir>{win_fonts.resolve().as_posix()}</dir>
     <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
     <include ignore_missing="yes">/usr/local/etc/fonts/fonts.conf</include>
     <include ignore_missing="yes">/opt/homebrew/etc/fonts/fonts.conf</include>
