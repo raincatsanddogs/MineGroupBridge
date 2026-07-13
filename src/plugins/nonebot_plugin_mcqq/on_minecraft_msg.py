@@ -56,7 +56,7 @@ async def handle_mc_otherevent(event: PlayerAchievementEvent):
     message = (
         event.achievement.translate.text
         if event.achievement.translate and event.achievement.translate.text
-        else f"{event.player.nickname} 获得了成就({event.achievement.display.title.text if event.achievement.display and event.achievement.display.title and event.achievement.display.title.text else '未知成就'})"
+        else f"{event.player.nickname} 获得了进度：{event.achievement.display.title.text if event.achievement.display and event.achievement.display.title and event.achievement.display.title.text else '未知成就'}"
     )
 
     message_img = None
