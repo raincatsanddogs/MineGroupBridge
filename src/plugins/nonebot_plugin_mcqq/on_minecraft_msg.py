@@ -55,8 +55,8 @@ async def handle_mc_quit(event: PlayerQuitEvent):
 async def handle_mc_otherevent(event: PlayerAchievementEvent):
     message = (
         event.achievement.translate.text
-        if event.achievement and event.achievement.translate and event.achievement.translate.text
-        else f"{event.player.nickname} 获得了成就({event.achievement.key if event.achievement else '未知'})"
+        if event.achievement.translate and event.achievement.translate.text
+        else f"{event.player.nickname} 获得了成就({event.achievement.translate.text if event.achievement else '未知'})"
     )
 
     message_img = None
