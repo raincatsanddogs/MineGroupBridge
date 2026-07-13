@@ -37,7 +37,13 @@ async def get_resource_path(key: str, prefix: str) -> str | None:
         return None
 
     try:
-        target_key = advancements[key]["icon"]["id"]
+        icon_obj = advancements[key]
+        if isinstance(icon_obj, dict):
+            target_key = icon_obj.get("id") or icon_obj.get("item") or "barrier"
+        elif isinstance(icon_obj, str):
+            target_key = icon_obj
+        else:
+            target_key = "barrier"
     except KeyError as e:
         target_key = "barrier"
         logger.warning(f"找不到对应的键: {e}")
