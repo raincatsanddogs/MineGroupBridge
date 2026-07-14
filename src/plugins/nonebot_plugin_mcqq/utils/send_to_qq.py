@@ -18,7 +18,8 @@ async def send_mc_msg_to_qq(server_name: str, result: str, img_bytes: bytes | No
     msg_result = re.sub(r"[&§].", "", result)
     if server := plugin_config.server_dict.get(server_name):
         if plugin_config.display_server_name:
-            msg_result = f"[{server.nickname or server_name}] {msg_result}"
+            display_name = server.nickname or f"[{server_name}]"
+            msg_result = f"{display_name} {msg_result}"
 
         for group in server.group_list:
             if bot := __get_target_bot(group.bot_id, True, group.group_id, msg_result or "[图片消息]"):
