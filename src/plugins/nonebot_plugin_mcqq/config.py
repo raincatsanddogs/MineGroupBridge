@@ -45,6 +45,8 @@ class Group(BaseModel):
 class Server(BaseModel):
     """服务器配置"""
 
+    nickname: str = ""
+    """服务器昵称"""
     group_list: list[Group] = []
     """群列表"""
     guild_list: list[Guild] = []
@@ -95,7 +97,7 @@ class MCQQConfig(BaseModel):
     say_way: str = " "
     """用户发言修饰"""
 
-    username_way: list[str] = ["<",">"]
+    username_way: list[str] = ["<", ">"]
     """用户名修饰"""
 
     server_dict: dict[str, Server] = Field(default_factory=dict)
@@ -214,6 +216,7 @@ if not config_path.exists():
     else:
         try:
             import json
+
             if PYDANTIC_V2:
                 default_data = json.loads(MCQQConfig().model_dump_json())
             else:
@@ -228,6 +231,7 @@ plugin_config = MCQQConfig()
 loaded_from_nonebot = False
 try:
     from nonebot import get_driver
+
     driver = get_driver()
     mc_qq_raw = getattr(driver.config, "mc_qq", None)
     if mc_qq_raw:
@@ -262,7 +266,9 @@ if not loaded_from_nonebot:
                 plugin_config = MCQQConfig.parse_obj(yaml_data)
             logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
         except Exception as e:
-            logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
+            logger.error(
+                f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}"
+            )
 
 if plugin_config.ignore_word_list:
     IGNORE_WORD_LIST.add(*plugin_config.ignore_word_list)

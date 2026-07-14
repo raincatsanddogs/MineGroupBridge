@@ -21,6 +21,7 @@ cmd_whitelist:
 # 群服互联的核心映射配置
 server_dict:
   "my_minecraft_server":
+    nickname: "我的Minecraft服务器" # 昵称
     group_list:
       - group_id: "123456789" # QQ群号
         adapter: "onebot"    # 适配器名称

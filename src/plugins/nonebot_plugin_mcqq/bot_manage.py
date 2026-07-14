@@ -75,10 +75,11 @@ async def notify_groups(server: Server, server_id: str, connected: bool):
     :param server_id: 服务器ID
     :param connected: 连接状态
     """
+    display_name = server.nickname or server_id
     msg = (
-        f"✅ 服务器 [{server_id}] 已成功连接！"
+        f"✅ 服务器 [{display_name}] 已成功连接！"
         if connected
-        else f"⚠️ 服务器 [{server_id}] 已断开连接！"
+        else f"⚠️ 服务器 [{display_name}] 已断开连接！"
     )
 
     for group in server.group_list:

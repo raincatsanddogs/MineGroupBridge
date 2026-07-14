@@ -18,7 +18,7 @@ async def send_mc_msg_to_qq(server_name: str, result: str, img_bytes: bytes | No
     msg_result = re.sub(r"[&§].", "", result)
     if server := plugin_config.server_dict.get(server_name):
         if plugin_config.display_server_name:
-            msg_result = f"[{server_name}] {msg_result}"
+            msg_result = f"[{server.nickname or server_name}] {msg_result}"
 
         for group in server.group_list:
             if bot := __get_target_bot(group.bot_id, True, group.group_id, msg_result or "[图片消息]"):
@@ -50,7 +50,9 @@ async def send_mc_msg_to_qq(server_name: str, result: str, img_bytes: bytes | No
                             )
                         else:
                             await bot.post_group_messages(
-                                group_openid=group.group_id, msg_type=0, content=msg_result
+                                group_openid=group.group_id,
+                                msg_type=0,
+                                content=msg_result,
                             )
                     except AuditException as e:
                         logger.debug(
