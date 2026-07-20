@@ -1,3 +1,4 @@
 command_header:
 - render
 res_path_prefix: ""
+component_asset_version: "1.21.4"

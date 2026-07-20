@@ -151,3 +151,8 @@ tests/
 LOCAL_APPDATA_FONTCONFIG_CACHE/
 fonts.conf
 src/plugins/minecraft_achievement_render/cache/
+
+# Keep renderer regression tests and their generated preview artifacts.
+.render-test-tmp/
+tests/
+
