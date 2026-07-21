@@ -13,6 +13,7 @@ from .resources import (
     ItemIconSpec,
     load_base_item_image,
     load_component_texture,
+    load_light_item_image,
     resolve_player_skin,
 )
 
@@ -737,6 +738,18 @@ def render_player_head(skin: Image.Image) -> Image.Image:
     return result
 
 
+async def _load_special_item_image(
+    item_path: str,
+    components: Mapping[str, object],
+    prefix: str,
+) -> Image.Image | None:
+    if item_path == "shield" or item_path.endswith("_banner"):
+        return await _render_banner_or_shield(item_path, components, prefix)
+    if item_path == "light":
+        return await load_light_item_image(components.get("block_state"), prefix)
+    return None
+
+
 async def render_item_icon(
     spec: ItemIconSpec,
     prefix: str = "",
@@ -746,16 +759,18 @@ async def render_item_icon(
     components = spec.components
     item_path = _item_path(spec.item_id)
 
-    if item_path == "shield" or item_path.endswith("_banner"):
-        image = await _render_banner_or_shield(item_path, components, prefix)
-    else:
-        image = None
+    image = await _load_special_item_image(item_path, components, prefix)
     if image is None:
         image = await load_base_item_image(spec.item_id, prefix)
-        if image.size != ICON_SIZE:
-            image = image.resize(ICON_SIZE, Image.Resampling.LANCZOS)
-        if image.mode != "RGBA":
-            image = image.convert("RGBA")
+    if image.size != ICON_SIZE:
+        resampling = (
+            Image.Resampling.NEAREST
+            if item_path == "light"
+            else Image.Resampling.LANCZOS
+        )
+        image = image.resize(ICON_SIZE, resampling)
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
 
     if item_path == "player_head" and "profile" in components:
         skin = await resolve_player_skin(components["profile"])

@@ -23,6 +23,6 @@ nb run
 
 本项目直接使用了：[17TheWord/nonebot-plugin-mcqq](https://github.com/17TheWord/nonebot-plugin-mcqq)的代码
 
-资源文件为：[Owen1212055/mc-assets](https://github.com/Owen1212055/mc-assets)
+资源文件为：[Owen1212055/mc-assets](https://github.com/Owen1212055/mc-assets)、[InventivetalentDev/minecraft-assets](https://github.com/InventivetalentDev/minecraft-assets)
 
 minecraft字体来源：[minebbs](https://www.minebbs.com/resources/11063/)

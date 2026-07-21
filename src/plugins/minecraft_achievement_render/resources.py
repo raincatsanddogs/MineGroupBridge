@@ -31,6 +31,11 @@ ADVANCEMENTS_FILE = MODULE_DIR / "templates" / "advancements.json"
 ITEM_ASSET_ROOT = (
     "https://raw.githubusercontent.com/Owen1212055/mc-assets/main/item-assets/"
 )
+LIGHT_ASSET_VERSION = "26.2"
+LIGHT_ASSET_ROOT = (
+    "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/"
+    f"{LIGHT_ASSET_VERSION}/assets/minecraft/textures/item/"
+)
 COMPONENT_ASSET_VERSION = plugin_config.component_asset_version
 COMPONENT_ASSET_ROOT = (
     "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/"
@@ -49,6 +54,7 @@ COMPONENT_CACHE_SIZE = 32
 PROFILE_UUID_INT_PARTS = 4
 MIN_SKIN_WIDTH = 64
 MIN_SKIN_HEIGHT = 32
+LIGHT_LEVELS = range(16)
 PLAYER_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,16}$")
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,6 +196,22 @@ def _item_filename(item_id: str) -> str:
     return f"{safe_path.replace('/', '_').upper()}.png"
 
 
+def _light_filename(block_state: object) -> str:
+    if not isinstance(block_state, Mapping):
+        return "light.png"
+
+    raw_level = block_state.get("level")
+    if isinstance(raw_level, bool) or not isinstance(raw_level, (int, str)):
+        return "light.png"
+    try:
+        level = int(raw_level)
+    except ValueError:
+        return "light.png"
+    if level not in LIGHT_LEVELS:
+        return "light.png"
+    return f"light_{level:02d}.png"
+
+
 def _decode_image(data: bytes) -> Image.Image:
     with Image.open(io.BytesIO(data)) as source:
         source.load()
@@ -307,6 +329,23 @@ async def load_base_item_image(
     cache_path = CACHE_DIR / filename
     url = f"{prefix}{ITEM_ASSET_ROOT}{filename}"
     image = await _load_cached_image(cache_path, url, f"item:{filename}")
+    return image if image is not None else PLACEHOLDER_ICON.copy()
+
+
+async def load_light_item_image(
+    block_state: object,
+    prefix: str = "",
+) -> Image.Image:
+    """Load a Light icon variant selected by its block-state level."""
+
+    filename = _light_filename(block_state)
+    cache_path = CACHE_DIR / "light_assets" / LIGHT_ASSET_VERSION / filename
+    url = f"{prefix}{LIGHT_ASSET_ROOT}{filename}"
+    image = await _load_cached_image(
+        cache_path,
+        url,
+        f"light:{LIGHT_ASSET_VERSION}:{filename}",
+    )
     return image if image is not None else PLACEHOLDER_ICON.copy()
 
 
@@ -605,6 +644,7 @@ __all__ = [
     "get_icon_spec",
     "load_base_item_image",
     "load_component_texture",
+    "load_light_item_image",
     "load_skin_image",
     "normalize_profile_uuid",
     "resolve_player_skin",
