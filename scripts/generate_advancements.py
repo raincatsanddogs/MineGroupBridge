@@ -24,7 +24,7 @@ def process_zip_datapack(zip_path, advancements_map):
                     
                     try:
                         with z.open(file_info.filename) as f:
-                            data = json.loads(f.read().decode("utf-8"))
+                            data = json.loads(f.read().decode("utf-8-sig"))
                         if "display" in data and "icon" in data["display"]:
                             advancements_map[adv_key] = data["display"]["icon"]
                     except Exception as e:
