@@ -18,13 +18,29 @@ cmd_whitelist:
   - list
   - tps
   - banlist
+# 每个 Bot 的 MC→QQ 频率限制；缺省或 0 表示对应窗口不限流
+bot_rate_limits:
+  "987654321":
+    rpm: 20 # 60 秒滑动窗口内最多发送次数
+    rph: 500 # 3600 秒滑动窗口内最多发送次数
+  "123456789":
+    rpm: 20
+    rph: 500
+send_batch_max_messages: 40 # 每批原消息数，不包含合并转发提示节点
+send_route_queue_max_messages: 200 # 单个服务器到群/频道的积压上限
+send_global_queue_max_messages: 1000 # 所有路由合计积压上限
 # 群服互联的核心映射配置
 server_dict:
   "my_minecraft_server":
     nickname: "我的Minecraft服务器" # 昵称
+    # OneBot 合并转发的首个提示节点，留空可关闭
+    forward_batch_header: "以下是达到发送频率限制后合并的消息："
     group_list:
       - group_id: "123456789" # QQ群号
         adapter: "onebot"    # 适配器名称
-        bot_id: "987654321"   # 机器人QQ号
+        # 候选 Bot 按此顺序轮换；旧版单个 bot_id 写法仍然兼容
+        bot_ids:
+          - "987654321"
+          - "123456789"
     guild_list: []
     rcon_msg: false

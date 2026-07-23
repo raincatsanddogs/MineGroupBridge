@@ -5,19 +5,24 @@
 import importlib.util
 import json
 from pathlib import Path
-from typing import Any
-import yaml
+from typing import TYPE_CHECKING, Any
 
+import yaml
 from nonebot import logger
 from nonebot.compat import PYDANTIC_V2
 from pydantic import BaseModel, Field
 
-if PYDANTIC_V2:
+if TYPE_CHECKING:
+    # 静态检查同时声明两个兼容装饰器，运行时仍按 Pydantic 版本选择。
+    from pydantic import field_validator, validator
+elif PYDANTIC_V2:
     from pydantic import field_validator
 else:
     from pydantic import validator
 
 from .data_source import IGNORE_WORD_LIST
+
+MAX_COMMAND_PRIORITY = 98
 
 
 class Guild(BaseModel):
@@ -27,8 +32,15 @@ class Guild(BaseModel):
     """子频道号"""
     adapter: str
     """适配器类型"""
-    bot_id: str
-    """Bot ID 优先使用所选Bot发送消息"""
+    bot_id: str = ""
+    """兼容旧配置的首选 Bot ID"""
+    bot_ids: list[str] = Field(default_factory=list)
+    """按顺序参与发送轮换的 Bot ID"""
+
+    @property
+    def candidate_bot_ids(self) -> list[str]:
+        """合并新旧配置并保持 Bot 的配置顺序。"""
+        return list(dict.fromkeys(filter(None, (self.bot_id, *self.bot_ids))))
 
 
 class Group(BaseModel):
@@ -38,8 +50,24 @@ class Group(BaseModel):
     """群号"""
     adapter: str
     """适配器类型"""
-    bot_id: str
-    """Bot ID 优先使用所选Bot发送消息"""
+    bot_id: str = ""
+    """兼容旧配置的首选 Bot ID"""
+    bot_ids: list[str] = Field(default_factory=list)
+    """按顺序参与发送轮换的 Bot ID"""
+
+    @property
+    def candidate_bot_ids(self) -> list[str]:
+        """合并新旧配置并保持 Bot 的配置顺序。"""
+        return list(dict.fromkeys(filter(None, (self.bot_id, *self.bot_ids))))
+
+
+class BotRateLimit(BaseModel):
+    """单个 QQ Bot 的 MC→QQ 发送频率限制。"""
+
+    rpm: int = Field(default=0, ge=0)
+    """60 秒滑动窗口内的发送上限，0 表示不限。"""
+    rph: int = Field(default=0, ge=0)
+    """3600 秒滑动窗口内的发送上限，0 表示不限。"""
 
 
 class Server(BaseModel):
@@ -47,12 +75,14 @@ class Server(BaseModel):
 
     nickname: str = ""
     """服务器昵称"""
-    group_list: list[Group] = []
+    group_list: list[Group] = Field(default_factory=list)
     """群列表"""
-    guild_list: list[Guild] = []
+    guild_list: list[Guild] = Field(default_factory=list)
     """频道列表"""
     rcon_msg: bool = False
     """是否用Rcon发送消息"""
+    forward_batch_header: str = ""
+    """OneBot 合并转发消息的首个提示节点，空字符串表示关闭。"""
 
 
 class MCQQConfig(BaseModel):
@@ -112,21 +142,36 @@ class MCQQConfig(BaseModel):
     cmd_whitelist: set[str] = {"list", "tps", "banlist"}
     """命令白名单"""
 
+    bot_rate_limits: dict[str, BotRateLimit] = Field(default_factory=dict)
+    """每个 QQ Bot 的 RPM/RPH 限制；未配置的 Bot 不限流。"""
+
+    send_batch_max_messages: int = Field(default=40, ge=1)
+    """单批合并的原消息上限，不包含提示节点。"""
+
+    send_route_queue_max_messages: int = Field(default=200, ge=1)
+    """单个“服务器→目标”路由的积压消息上限。"""
+
+    send_global_queue_max_messages: int = Field(default=1000, ge=1)
+    """所有发送路由合计的积压消息上限。"""
+
     @classmethod
     def _get_common_set(
-        cls, v: Any, configuration_name: str, default_config: set = set()
-    ):
+        cls,
+        v: Any,
+        configuration_name: str,
+        default_config: set[Any] | None = None,
+    ) -> set[Any]:
+        default_config = default_config or set()
         if isinstance(v, str):
             logger.info(f"{configuration_name} is a string, use it as is.")
             return {v}
-        elif isinstance(v, list | set):
+        if isinstance(v, list | set):
             logger.info(f"{configuration_name} is a list, loaded {len(v)} items.")
             return set(v)
-        else:
-            logger.warning(
-                f"Invalid type for {configuration_name}: {type(v)}, use empty list."
-            )
-            return default_config
+        logger.warning(
+            f"Invalid type for {configuration_name}: {type(v)}, use empty list."
+        )
+        return default_config
 
     @(
         field_validator("command_header", mode="before")
@@ -152,7 +197,7 @@ class MCQQConfig(BaseModel):
         else validator("ignore_word_list", pre=True, always=True)
     )
     @classmethod
-    def validate_ignore_word_list(cls, v: Any):
+    def validate_ignore_word_list(cls, v: Any) -> set[str]:
         return cls._get_common_set(v, "ignore_word_list")
 
     @(
@@ -162,10 +207,10 @@ class MCQQConfig(BaseModel):
     )
     @classmethod
     def validate_priority(cls, v: int) -> int:
-        if 1 <= v <= 98:
+        if 1 <= v <= MAX_COMMAND_PRIORITY:
             return v
         logger.warning("Invalid command_priority, use default 98.")
-        return 98
+        return MAX_COMMAND_PRIORITY
 
     @(
         field_validator("rcon_result_to_image", mode="before")
@@ -173,7 +218,7 @@ class MCQQConfig(BaseModel):
         else validator("rcon_result_to_image", pre=True, always=True)
     )
     @classmethod
-    def validate_rcon_result_to_image(cls, v: bool) -> bool:
+    def validate_rcon_result_to_image(cls, v: bool) -> bool:  # noqa: FBT001
         is_pil_exists: bool = importlib.util.find_spec("PIL") is not None
         if v and not is_pil_exists:
             logger.warning(
@@ -221,10 +266,10 @@ if not config_path.exists():
                 default_data = json.loads(MCQQConfig().model_dump_json())
             else:
                 default_data = json.loads(MCQQConfig().json())
-            with open(config_path, "w", encoding="utf-8") as f:
+            with config_path.open("w", encoding="utf-8") as f:
                 yaml.safe_dump(default_data, f, allow_unicode=True, sort_keys=False)
             logger.info(f"MCQQ 插件已在 {config_path} 自动生成默认配置文件")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"生成默认配置文件失败：{e}")
 
 plugin_config = MCQQConfig()
@@ -252,23 +297,20 @@ try:
             loaded_from_nonebot = True
         if loaded_from_nonebot:
             logger.info("MCQQ 插件成功从 NoneBot 配置加载 mc_qq 项")
-except Exception as e:
+except Exception as e:  # noqa: BLE001
     logger.debug(f"从 NoneBot 配置加载 mc_qq 失败：{e}")
 
-if not loaded_from_nonebot:
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                yaml_data = yaml.safe_load(f) or {}
-            if PYDANTIC_V2:
-                plugin_config = MCQQConfig.model_validate(yaml_data)
-            else:
-                plugin_config = MCQQConfig.parse_obj(yaml_data)
-            logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
-        except Exception as e:
-            logger.error(
-                f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}"
-            )
+if not loaded_from_nonebot and config_path.exists():
+    try:
+        with config_path.open(encoding="utf-8") as f:
+            yaml_data = yaml.safe_load(f) or {}
+        if PYDANTIC_V2:
+            plugin_config = MCQQConfig.model_validate(yaml_data)
+        else:
+            plugin_config = MCQQConfig.parse_obj(yaml_data)
+        logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
 
 if plugin_config.ignore_word_list:
     IGNORE_WORD_LIST.add(*plugin_config.ignore_word_list)
@@ -276,9 +318,10 @@ if plugin_config.ignore_word_list:
 else:
     logger.info("敏感词列表为空，不加载")
 
-if Path(plugin_config.ignore_word_file).exists():
+ignore_word_path = Path(plugin_config.ignore_word_file)
+if ignore_word_path.exists():
     try:
-        with open(plugin_config.ignore_word_file, encoding="utf-8") as f:
+        with ignore_word_path.open(encoding="utf-8") as f:
             json_data = json.load(f)
             words = json_data.get("words", [])
             if words:
@@ -286,7 +329,7 @@ if Path(plugin_config.ignore_word_file).exists():
                 logger.info(f"加载敏感词文件成功，敏感词数量为 {len(words)}")
             else:
                 logger.warning("敏感词文件为空，不加载")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"加载敏感词文件失败，请检查文件格式，错误信息为：{e}")
 else:
     logger.info("敏感词文件不存在，不加载")

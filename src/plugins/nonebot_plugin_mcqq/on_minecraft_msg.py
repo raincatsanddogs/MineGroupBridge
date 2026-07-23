@@ -1,4 +1,4 @@
-from nonebot import on_message, on_notice , require
+from nonebot import on_message, on_notice, require
 from nonebot.adapters.minecraft import (
     PlayerAchievementEvent,
     PlayerChatEvent,
@@ -21,7 +21,7 @@ on_mc_notice = on_notice(priority=4, rule=mc_msg_rule)
 
 
 @on_mc_msg.handle()
-async def handle_mc_msg(event: PlayerChatEvent):
+async def handle_mc_msg(event: PlayerChatEvent) -> None:
     message_text = str(event.message)
     if message_text.startswith("!!"):
         return
@@ -34,29 +34,48 @@ async def handle_mc_msg(event: PlayerChatEvent):
 
 
 @on_mc_notice.handle()
-async def handle_mc_death(event: PlayerDeathEvent):
+async def handle_mc_death(event: PlayerDeathEvent) -> None:
     await send_mc_msg_to_qq(
         event.server_name,
         event.death.text or f"{event.player.nickname} 死亡了",
+        queue_when_limited=False,
     )
 
 
 @on_mc_notice.handle()
-async def handle_mc_notice(event: PlayerJoinEvent):
-    await send_mc_msg_to_qq(event.server_name, f"{event.player.nickname} 加入了游戏")
+async def handle_mc_notice(event: PlayerJoinEvent) -> None:
+    # 进退服与死亡通知时效性强，超限或已有积压时不进入缓存。
+    await send_mc_msg_to_qq(
+        event.server_name,
+        f"{event.player.nickname} 加入了游戏",
+        queue_when_limited=False,
+    )
 
 
 @on_mc_notice.handle()
-async def handle_mc_quit(event: PlayerQuitEvent):
-    await send_mc_msg_to_qq(event.server_name, f"{event.player.nickname} 离开了游戏")
+async def handle_mc_quit(event: PlayerQuitEvent) -> None:
+    await send_mc_msg_to_qq(
+        event.server_name,
+        f"{event.player.nickname} 离开了游戏",
+        queue_when_limited=False,
+    )
 
 
 @on_mc_notice.handle()
-async def handle_mc_otherevent(event: PlayerAchievementEvent):
+async def handle_mc_otherevent(event: PlayerAchievementEvent) -> None:
+    achievement_title = (
+        event.achievement.display.title.text
+        if (
+            event.achievement.display
+            and event.achievement.display.title
+            and event.achievement.display.title.text
+        )
+        else "未知成就"
+    )
     message = (
         event.achievement.translate.text
         if event.achievement.translate and event.achievement.translate.text
-        else f"{event.player.nickname} 达成了进度：{event.achievement.display.title.text if event.achievement.display and event.achievement.display.title and event.achievement.display.title.text else '未知成就'}"
+        else f"{event.player.nickname} 达成了进度：{achievement_title}"
     )
 
     message_img = None
@@ -91,11 +110,7 @@ async def handle_mc_otherevent(event: PlayerAchievementEvent):
             achi_title,
             achi_desc,
             achi_frame,
-            achi_key
+            achi_key,
         )
 
-    await send_mc_msg_to_qq(
-        event.server_name,
-        message,
-        message_img
-    )
+    await send_mc_msg_to_qq(event.server_name, message, message_img)
