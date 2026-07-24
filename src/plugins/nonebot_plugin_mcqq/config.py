@@ -4,6 +4,7 @@
 
 import importlib.util
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,14 +16,19 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     # 静态检查同时声明两个兼容装饰器，运行时仍按 Pydantic 版本选择。
     from pydantic import field_validator, validator
+
+    from .utils.sensitive_words import SensitiveWordRuntimeSnapshot
 elif PYDANTIC_V2:
     from pydantic import field_validator
 else:
     from pydantic import validator
 
-from .data_source import IGNORE_WORD_LIST
+from .data_source import IGNORE_WORD_LIST, IGNORE_WORD_REPLACEMENTS
 
 MAX_COMMAND_PRIORITY = 98
+DEFAULT_IGNORE_WORD_MODE = "replace"
+DEFAULT_IGNORE_WORD_REPLACEMENT = "***"
+VALID_IGNORE_WORD_MODES = {"block", "replace"}
 
 
 class Guild(BaseModel):
@@ -97,8 +103,17 @@ class MCQQConfig(BaseModel):
     ignore_word_file: str = "./src/mc_qq_ignore_word_list.json"
     """敏感词文件路径"""
 
-    ignore_word_list: set[str] = set()
+    ignore_word_list: set[str] = Field(default_factory=set)
     """忽略的敏感词列表"""
+
+    ignore_word_mode: str = DEFAULT_IGNORE_WORD_MODE
+    """敏感词处理模式：block 屏蔽整条消息，replace 替换命中内容。"""
+
+    ignore_word_replacement: str = DEFAULT_IGNORE_WORD_REPLACEMENT
+    """没有逐词映射时使用的全局替换文本。"""
+
+    ignore_word_replacements: dict[str, str] = Field(default_factory=dict)
+    """敏感词到替换文本的逐词映射；映射键会自动加入敏感词列表。"""
 
     command_priority: int = 98
     """命令优先级，1-98，消息优先级=命令优先级 - 1"""
@@ -199,6 +214,60 @@ class MCQQConfig(BaseModel):
     @classmethod
     def validate_ignore_word_list(cls, v: Any) -> set[str]:
         return cls._get_common_set(v, "ignore_word_list")
+
+    @(
+        field_validator("ignore_word_mode", mode="before")
+        if PYDANTIC_V2
+        else validator("ignore_word_mode", pre=True, always=True)
+    )
+    @classmethod
+    def validate_ignore_word_mode(cls, v: Any) -> str:
+        if isinstance(v, str) and v.strip().lower() in VALID_IGNORE_WORD_MODES:
+            return v.strip().lower()
+        logger.warning(
+            f"Invalid ignore_word_mode: {v!r}, use {DEFAULT_IGNORE_WORD_MODE}."
+        )
+        return DEFAULT_IGNORE_WORD_MODE
+
+    @(
+        field_validator("ignore_word_replacement", mode="before")
+        if PYDANTIC_V2
+        else validator("ignore_word_replacement", pre=True, always=True)
+    )
+    @classmethod
+    def validate_ignore_word_replacement(cls, v: Any) -> str:
+        if isinstance(v, str):
+            return v
+        logger.warning(
+            f"Invalid ignore_word_replacement, use {DEFAULT_IGNORE_WORD_REPLACEMENT!r}."
+        )
+        return DEFAULT_IGNORE_WORD_REPLACEMENT
+
+    @(
+        field_validator("ignore_word_replacements", mode="before")
+        if PYDANTIC_V2
+        else validator("ignore_word_replacements", pre=True, always=True)
+    )
+    @classmethod
+    def validate_ignore_word_replacements(cls, v: Any) -> dict[str, str]:
+        if not isinstance(v, dict):
+            logger.warning("Invalid ignore_word_replacements, use empty mapping.")
+            return {}
+
+        replacements: dict[str, str] = {}
+        for word, replacement in v.items():
+            if not isinstance(word, str) or not word.strip():
+                logger.warning("Ignore an empty or non-string sensitive word mapping.")
+                continue
+            replacement_value = replacement
+            if not isinstance(replacement, str):
+                logger.warning(
+                    f"Invalid replacement for sensitive word {word!r}, "
+                    f"use {DEFAULT_IGNORE_WORD_REPLACEMENT!r}."
+                )
+                replacement_value = DEFAULT_IGNORE_WORD_REPLACEMENT
+            replacements[word] = replacement_value
+        return replacements
 
     @(
         field_validator("command_priority", mode="before")
@@ -312,24 +381,221 @@ if not loaded_from_nonebot and config_path.exists():
     except Exception as e:  # noqa: BLE001
         logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
 
-if plugin_config.ignore_word_list:
-    IGNORE_WORD_LIST.add(*plugin_config.ignore_word_list)
-    logger.info("加载敏感词列表成功")
-else:
-    logger.info("敏感词列表为空，不加载")
+@dataclass(frozen=True, slots=True)
+class _ExternalSensitiveWords:
+    """一个具体 JSON 路径最近一次成功解析出的不可变词库。"""
 
-ignore_word_path = Path(plugin_config.ignore_word_file)
-if ignore_word_path.exists():
+    path: Path
+    words: tuple[str, ...]
+    replacements: tuple[tuple[str, str], ...]
+
+
+_last_valid_external_words: _ExternalSensitiveWords | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SensitiveWordCandidate:
+    """已完成解析和编译、尚未发布的敏感词运行态。"""
+
+    runtime: "SensitiveWordRuntimeSnapshot"
+    external_words: _ExternalSensitiveWords | None
+
+
+def _collect_valid_words(raw_words: Any, source: str) -> list[str]:
+    """校验外部词条，防止空词命中所有消息或非法类型破坏匹配器。"""
+    if not isinstance(raw_words, list | set | tuple):
+        if raw_words:
+            logger.warning(f"{source} 的 words 必须是数组，已忽略")
+        return []
+
+    words: list[str] = []
+    for word in raw_words:
+        if isinstance(word, str) and word.strip():
+            words.append(word)
+        else:
+            logger.warning(f"{source} 中存在空词或非字符串词条，已忽略")
+    return words
+
+
+def _collect_valid_replacements(raw_replacements: Any, source: str) -> dict[str, str]:
+    """校验逐词替换映射；空字符串替换值是合法的删除操作。"""
+    if not isinstance(raw_replacements, dict):
+        if raw_replacements:
+            logger.warning(f"{source} 的 replacements 必须是对象，已忽略")
+        return {}
+
+    replacements: dict[str, str] = {}
+    for word, replacement in raw_replacements.items():
+        if not isinstance(word, str) or not word.strip():
+            logger.warning(f"{source} 中存在空词或非字符串映射键，已忽略")
+            continue
+        replacement_value = replacement
+        if not isinstance(replacement, str):
+            logger.warning(
+                f"{source} 中 {word!r} 的替换值不是字符串，"
+                f"已回退为 {DEFAULT_IGNORE_WORD_REPLACEMENT!r}"
+            )
+            replacement_value = DEFAULT_IGNORE_WORD_REPLACEMENT
+        replacements[word] = replacement_value
+    return replacements
+
+
+def _normalized_sensitive_word_path(path: str) -> Path:
+    return Path(path).resolve(strict=False)
+
+
+def _read_external_sensitive_words(path: Path) -> _ExternalSensitiveWords:
+    """读取一个完整 JSON 候选；格式错误由调用方决定是否回退。"""
+    if not path.exists():
+        logger.info(f"敏感词文件不存在，按空外部词库处理：{path}")
+        return _ExternalSensitiveWords(path, (), ())
+
+    with path.open(encoding="utf-8") as file:
+        json_data = json.load(file)
+    if not isinstance(json_data, dict):
+        msg = "敏感词 JSON 根节点必须是对象"
+        raise TypeError(msg)
+
+    json_words = _collect_valid_words(json_data.get("words", []), "敏感词 JSON")
+    json_replacements = _collect_valid_replacements(
+        json_data.get("replacements", {}),
+        "敏感词 JSON",
+    )
+    logger.info(
+        "加载敏感词文件成功，"
+        f"普通词数量为 {len(json_words)}，逐词映射数量为 {len(json_replacements)}"
+    )
+    return _ExternalSensitiveWords(
+        path=path,
+        words=tuple(json_words),
+        replacements=tuple(json_replacements.items()),
+    )
+
+
+def _merge_sensitive_words(
+    mcqq_config: MCQQConfig,
+    external_words: _ExternalSensitiveWords | None,
+) -> tuple[set[str], dict[str, str]]:
+    """合并 YAML 与已校验 JSON；YAML 的逐词映射拥有更高优先级。"""
+    words = set(_collect_valid_words(mcqq_config.ignore_word_list, "mc_qq.yaml"))
+    replacements = dict(mcqq_config.ignore_word_replacements)
+    words.update(replacements)
+
+    if external_words is None:
+        return words, replacements
+
+    words.update(external_words.words)
+    words.update(word for word, _replacement in external_words.replacements)
+    # setdefault 保证 YAML 中同名映射覆盖 JSON，同时保留两边的声明顺序。
+    for word, replacement in external_words.replacements:
+        replacements.setdefault(word, replacement)
+    return words, replacements
+
+
+def _load_sensitive_words(
+    mcqq_config: MCQQConfig,
+) -> tuple[set[str], dict[str, str]]:
+    """兼容的独立加载入口；失败时返回 YAML 词库且不改变运行时缓存。"""
+    path = _normalized_sensitive_word_path(mcqq_config.ignore_word_file)
     try:
-        with ignore_word_path.open(encoding="utf-8") as f:
-            json_data = json.load(f)
-            words = json_data.get("words", [])
-            if words:
-                IGNORE_WORD_LIST.update(words)
-                logger.info(f"加载敏感词文件成功，敏感词数量为 {len(words)}")
-            else:
-                logger.warning("敏感词文件为空，不加载")
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"加载敏感词文件失败，请检查文件格式，错误信息为：{e}")
-else:
-    logger.info("敏感词文件不存在，不加载")
+        external_words = _read_external_sensitive_words(path)
+    except Exception as error:  # noqa: BLE001
+        logger.error(f"加载敏感词文件失败，已仅使用 YAML 词库：{error}")
+        external_words = None
+    return _merge_sensitive_words(mcqq_config, external_words)
+
+
+def _prepare_sensitive_words(
+    mcqq_config: MCQQConfig,
+    *,
+    reload_external: bool,
+    preserve_on_external_error: bool = False,
+    prewarm_phonetic: bool,
+) -> _SensitiveWordCandidate | None:
+    """
+    完整构建候选快照，但不改变当前运行态。
+
+    JSON 文件事件解析失败时直接保留上一运行态；YAML 启动或切换到一个尚无
+    有效快照的新路径时，则安全地退回 YAML 词库。
+    """
+    from .utils.sensitive_words import build_sensitive_runtime
+
+    path = _normalized_sensitive_word_path(mcqq_config.ignore_word_file)
+    cached_external = _last_valid_external_words
+    should_read_external = (
+        reload_external or cached_external is None or cached_external.path != path
+    )
+    external_words: _ExternalSensitiveWords | None
+
+    if should_read_external:
+        try:
+            external_words = _read_external_sensitive_words(path)
+        except Exception as error:  # noqa: BLE001
+            if preserve_on_external_error:
+                logger.error(f"敏感词 JSON 热重载失败，已保留当前词库和过滤器：{error}")
+                return None
+            logger.error(f"敏感词 JSON 无可用快照，已仅使用 YAML 词库：{error}")
+            external_words = None
+    else:
+        external_words = cached_external
+
+    words, replacements = _merge_sensitive_words(mcqq_config, external_words)
+    try:
+        runtime = build_sensitive_runtime(
+            words,
+            replacements,
+            mode=mcqq_config.ignore_word_mode,
+            default_replacement=mcqq_config.ignore_word_replacement,
+            prewarm_phonetic=prewarm_phonetic,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("构建敏感词候选过滤器失败，已保留上一运行态")
+        return None
+
+    return _SensitiveWordCandidate(runtime, external_words)
+
+
+def _commit_sensitive_words(candidate: _SensitiveWordCandidate) -> None:
+    """以一个运行时引用为发布点，再同步只用于兼容的可变全局数据。"""
+    global _last_valid_external_words  # noqa: PLW0603
+
+    from .utils.sensitive_words import publish_sensitive_runtime
+
+    runtime = candidate.runtime
+    publish_sensitive_runtime(runtime)
+    IGNORE_WORD_LIST.clear()
+    IGNORE_WORD_LIST.update(runtime.words)
+    IGNORE_WORD_REPLACEMENTS.clear()
+    IGNORE_WORD_REPLACEMENTS.update(runtime.replacements)
+    _last_valid_external_words = candidate.external_words
+
+    if runtime.words:
+        logger.info(f"加载敏感词成功，敏感词总数为 {len(runtime.words)}")
+    else:
+        logger.info("敏感词列表为空，不启用过滤")
+
+
+def _publish_sensitive_words(
+    mcqq_config: MCQQConfig,
+    *,
+    reload_external: bool,
+    preserve_on_external_error: bool = False,
+    prewarm_phonetic: bool,
+) -> bool:
+    candidate = _prepare_sensitive_words(
+        mcqq_config,
+        reload_external=reload_external,
+        preserve_on_external_error=preserve_on_external_error,
+        prewarm_phonetic=prewarm_phonetic,
+    )
+    if candidate is None:
+        return False
+    _commit_sensitive_words(candidate)
+    return True
+
+
+_publish_sensitive_words(
+    plugin_config,
+    reload_external=True,
+    prewarm_phonetic=False,
+)

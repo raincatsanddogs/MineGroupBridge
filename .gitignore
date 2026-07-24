@@ -155,4 +155,4 @@ src/plugins/minecraft_achievement_render/cache/
 # Keep renderer regression tests and their generated preview artifacts.
 .render-test-tmp/
 tests/
-
+src/plugins/minecraft_achievement_render/templates/*.zip

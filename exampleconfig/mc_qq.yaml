@@ -1,6 +1,14 @@
 command_header:
   - mcc
 ignore_word_file: "./src/mc_qq_ignore_word_list.json"
+# 敏感词处理模式：replace 替换命中内容，block 屏蔽整条消息
+ignore_word_mode: "replace"
+# 未配置逐词映射时使用的替换文本，允许设为空字符串以删除命中内容
+ignore_word_replacement: "***"
+# 映射键会自动加入敏感词库；同名配置优先于 JSON 词库
+ignore_word_replacements:
+  "杀": "哈！"
+  "死": "猫"
 command_priority: 98
 command_block: true
 notice_connected: false

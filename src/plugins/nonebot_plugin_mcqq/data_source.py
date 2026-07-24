@@ -3,6 +3,9 @@ from collections import defaultdict
 IGNORE_WORD_LIST: set[str] = set()
 """忽略的敏感词列表"""
 
+IGNORE_WORD_REPLACEMENTS: dict[str, str] = {}
+"""敏感词对应的自定义替换文本，字典顺序同时表示同优先级时的声明顺序。"""
+
 ONEBOT_GROUP_SERVER_DICT: dict[str, list[str]] = defaultdict(list)
 """OneBot 群服映射"""
 

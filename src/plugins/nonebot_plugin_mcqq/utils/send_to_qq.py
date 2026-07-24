@@ -16,6 +16,7 @@ from nonebot.adapters.qq import Message as QQMessage
 from nonebot.adapters.qq import MessageSegment as QQMessageSegment
 
 from ..config import BotRateLimit, Server, plugin_config  # noqa: TID252
+from .sensitive_words import filter_current_sensitive_text
 
 MINUTE_SECONDS = 60.0
 HOUR_SECONDS = 3600.0
@@ -727,6 +728,13 @@ async def send_mc_msg_to_qq(
     if plugin_config.display_server_name:
         display_name = server.nickname or f"[{server_name}]"
         msg_result = f"{display_name} {msg_result}"
+
+    # 在最终可见文本进入限流队列前过滤，确保昵称、服务器名和通知同样生效。
+    filtered_result = filter_current_sensitive_text(msg_result)
+    if filtered_result is None:
+        logger.info(f"[MC_QQ]丨服务器 {server_name} 的消息命中敏感词，已屏蔽")
+        return
+    msg_result = filtered_result
 
     routes = _dispatcher.routes_for_server(server_name, server)
     for route in routes:
