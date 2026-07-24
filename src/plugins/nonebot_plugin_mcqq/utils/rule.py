@@ -77,9 +77,10 @@ def all_msg_rule(
     bot: QQBot | OneBot | None = None,
 ) -> bool:
     """
-    检测绑定目标，并只允许配置顺序最靠前的在线 Bot 处理入站消息。
+    检测绑定目标，过滤候选池 Bot 消息，并只允许首个在线 Bot 处理入站消息。
 
-    该主 Bot 选择仅用于防止多 Bot 同群时重复转发，不参与出站轮换。
+    候选池过滤用于避免出站消息被同池其他 Bot 转回 MC；主 Bot 选择仅用于
+    防止多 Bot 同群时重复转发，不参与出站轮换。
     """
     if isinstance(event, QQGroupMessageCreateEvent):
         is_bound = event.group_openid in QQ_GROUP_SERVER_DICT
@@ -96,8 +97,14 @@ def all_msg_rule(
         # 兼容直接调用规则的旧代码；NoneBot 实际执行规则时始终会注入 Bot。
         return True
 
+    candidate_bot_ids = _candidate_bot_ids_for_event(event)
+    # self_id 是接收事件的 Bot；get_user_id() 才是消息发送者。拒绝同池 Bot
+    # 发出的消息，避免一个 Bot 的 MC→QQ 消息被另一个 Bot 再转回 MC。
+    if event.get_user_id() in candidate_bot_ids:
+        return False
+
     bots = get_bots()
-    for bot_id in _candidate_bot_ids_for_event(event):
+    for bot_id in candidate_bot_ids:
         candidate = bots.get(bot_id)
         if (
             isinstance(event, OneBotGroupMessageEvent) and isinstance(candidate, OneBot)
