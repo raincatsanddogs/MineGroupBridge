@@ -46,6 +46,7 @@ class _RouteState:
     pending: deque[_PendingText] = field(default_factory=deque)
     cursor: int = 0
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active: bool = True
 
     @property
     def server_name(self) -> str:
@@ -138,12 +139,10 @@ class _SendDispatcher:
         self._drop_counts: dict[str, int] = {}
         self._last_drop_log = 0.0
 
-    def routes_for_server(
-        self,
-        server_name: str,
+    @staticmethod
+    def _group_route_targets(
         server: Server,
-    ) -> list[_RouteState]:
-        """合并服务器内的重复目标，并按配置顺序汇集候选 Bot。"""
+    ) -> OrderedDict[tuple[TargetKind, str, str], list[str]]:
         grouped: OrderedDict[
             tuple[TargetKind, str, str],
             list[str],
@@ -162,6 +161,15 @@ class _SendDispatcher:
             for bot_id in guild.candidate_bot_ids:
                 if bot_id not in bot_ids:
                     bot_ids.append(bot_id)
+        return grouped
+
+    def routes_for_server(
+        self,
+        server_name: str,
+        server: Server,
+    ) -> list[_RouteState]:
+        """合并服务器内的重复目标，并按配置顺序汇集候选 Bot。"""
+        grouped = self._group_route_targets(server)
 
         routes: list[_RouteState] = []
         for (target_kind, adapter, target_id), bot_ids in grouped.items():
@@ -187,6 +195,64 @@ class _SendDispatcher:
                 self._routes[route_key] = route
             routes.append(route)
         return routes
+
+    def _drop_route_pending_locked(self, route: _RouteState) -> None:
+        dropped_count = len(route.pending)
+        for pending in route.pending:
+            self._global_pending.pop(pending.sequence, None)
+        route.pending.clear()
+        if dropped_count:
+            self._record_drop_locked("路由已删除", dropped_count)
+
+    async def reconfigure(self) -> None:
+        """Apply route and limit changes without rebuilding unused route objects."""
+
+        desired_routes: dict[RouteKey, tuple[tuple[str, ...], str]] = {}
+        for server_name, server in plugin_config.server_dict.items():
+            for (target_kind, adapter, target_id), bot_ids in self._group_route_targets(
+                server
+            ).items():
+                desired_routes[(server_name, target_kind, adapter, target_id)] = (
+                    tuple(bot_ids),
+                    server.forward_batch_header,
+                )
+
+        async with self._state_lock:
+            for route_key, route in tuple(self._routes.items()):
+                desired = desired_routes.get(route_key)
+                if desired is None:
+                    route.active = False
+                    self._drop_route_pending_locked(route)
+                    del self._routes[route_key]
+                    continue
+
+                route.bot_ids, route.forward_batch_header = desired
+                route.active = True
+                if route.bot_ids:
+                    route.cursor %= len(route.bot_ids)
+                else:
+                    route.cursor = 0
+
+                while len(route.pending) > plugin_config.send_route_queue_max_messages:
+                    dropped = route.pending.popleft()
+                    self._global_pending.pop(dropped.sequence, None)
+                    self._record_drop_locked("达到单路由上限")
+
+            while (
+                len(self._global_pending) > plugin_config.send_global_queue_max_messages
+            ):
+                self._drop_global_oldest_locked()
+
+            enabled_limits = {
+                bot_id
+                for bot_id, limit in plugin_config.bot_rate_limits.items()
+                if limit.rpm or limit.rph
+            }
+            for bot_id in tuple(self._windows):
+                if bot_id not in enabled_limits:
+                    del self._windows[bot_id]
+
+            self._wake_event.set()
 
     @staticmethod
     def _bot_matches_route(bot: object, route: _RouteState) -> bool:
@@ -337,6 +403,10 @@ class _SendDispatcher:
         batch: list[_PendingText],
     ) -> None:
         """失败批次保持原顺序回到队首，并优先淘汰更新的消息。"""
+        if not route.active:
+            self._record_drop_locked("路由已删除", len(batch))
+            return
+
         while (
             len(route.pending) + len(batch)
             > plugin_config.send_route_queue_max_messages
@@ -744,6 +814,12 @@ async def send_mc_msg_to_qq(
             img_bytes,
             queue_when_limited=queue_when_limited,
         )
+
+
+async def reconfigure_dispatcher() -> None:
+    """Apply hot-reloaded route and limit settings to live dispatcher state."""
+
+    await _dispatcher.reconfigure()
 
 
 @get_driver().on_shutdown

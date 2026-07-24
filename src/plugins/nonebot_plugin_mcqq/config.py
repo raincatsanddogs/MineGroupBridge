@@ -4,14 +4,18 @@
 
 import importlib.util
 import json
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
-from nonebot import logger
+from nonebot import get_driver, logger
 from nonebot.compat import PYDANTIC_V2
 from pydantic import BaseModel, Field
+
+from src.config_reload import config_reload_service, replace_model_state
 
 if TYPE_CHECKING:
     # 静态检查同时声明两个兼容装饰器，运行时仍按 Pydantic 版本选择。
@@ -316,70 +320,134 @@ class MCQQConfig(BaseModel):
 class Config(BaseModel):
     """配置项"""
 
-    mc_qq: MCQQConfig = MCQQConfig()
+    mc_qq: MCQQConfig = Field(default_factory=MCQQConfig)
 
 
-config_path = Path("config/mc_qq.yaml")
-if not config_path.parent.exists():
-    config_path.parent.mkdir(parents=True, exist_ok=True)
+STARTUP_COMMAND_FIELDS = frozenset(
+    {"command_header", "command_priority", "command_block"}
+)
+SENSITIVE_CONFIG_FIELDS = frozenset(
+    {
+        "ignore_word_file",
+        "ignore_word_list",
+        "ignore_word_mode",
+        "ignore_word_replacement",
+        "ignore_word_replacements",
+    }
+)
+DISPATCH_CONFIG_FIELDS = frozenset(
+    {
+        "server_dict",
+        "bot_rate_limits",
+        "send_batch_max_messages",
+        "send_route_queue_max_messages",
+        "send_global_queue_max_messages",
+    }
+)
 
-if not config_path.exists():
-    alt_path = Path("mc_qq.yaml")
-    if alt_path.exists():
-        config_path = alt_path
-    else:
-        try:
-            import json
 
-            if PYDANTIC_V2:
-                default_data = json.loads(MCQQConfig().model_dump_json())
-            else:
-                default_data = json.loads(MCQQConfig().json())
-            with config_path.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(default_data, f, allow_unicode=True, sort_keys=False)
-            logger.info(f"MCQQ 插件已在 {config_path} 自动生成默认配置文件")
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"生成默认配置文件失败：{e}")
+def _model_dump(model: BaseModel, *, exclude_unset: bool = False) -> dict[str, Any]:
+    if PYDANTIC_V2:
+        return model.model_dump(mode="python", exclude_unset=exclude_unset)
+    return model.dict(exclude_unset=exclude_unset)
 
-plugin_config = MCQQConfig()
-loaded_from_nonebot = False
-try:
-    from nonebot import get_driver
 
-    driver = get_driver()
-    mc_qq_raw = getattr(driver.config, "mc_qq", None)
-    if mc_qq_raw:
-        if isinstance(mc_qq_raw, dict):
-            if PYDANTIC_V2:
-                plugin_config = MCQQConfig.model_validate(mc_qq_raw)
-            else:
-                plugin_config = MCQQConfig.parse_obj(mc_qq_raw)
-            loaded_from_nonebot = True
-        elif isinstance(mc_qq_raw, MCQQConfig):
-            plugin_config = mc_qq_raw
-            loaded_from_nonebot = True
-        elif hasattr(mc_qq_raw, "model_dump"):
-            plugin_config = MCQQConfig.model_validate(mc_qq_raw.model_dump())
-            loaded_from_nonebot = True
-        elif hasattr(mc_qq_raw, "dict"):
-            plugin_config = MCQQConfig.parse_obj(mc_qq_raw.dict())
-            loaded_from_nonebot = True
-        if loaded_from_nonebot:
-            logger.info("MCQQ 插件成功从 NoneBot 配置加载 mc_qq 项")
-except Exception as e:  # noqa: BLE001
-    logger.debug(f"从 NoneBot 配置加载 mc_qq 失败：{e}")
+def _validate_mcqq_config(data: Mapping[str, Any]) -> MCQQConfig:
+    if PYDANTIC_V2:
+        return MCQQConfig.model_validate(data)
+    return MCQQConfig.parse_obj(data)
 
-if not loaded_from_nonebot and config_path.exists():
+
+def _resolve_config_path() -> Path:
+    primary = Path("config/mc_qq.yaml")
+    primary.parent.mkdir(parents=True, exist_ok=True)
+    if primary.exists():
+        return primary
+
+    alternative = Path("mc_qq.yaml")
+    if alternative.exists():
+        return alternative
+
     try:
-        with config_path.open(encoding="utf-8") as f:
-            yaml_data = yaml.safe_load(f) or {}
-        if PYDANTIC_V2:
-            plugin_config = MCQQConfig.model_validate(yaml_data)
-        else:
-            plugin_config = MCQQConfig.parse_obj(yaml_data)
-        logger.info(f"MCQQ 插件成功加载配置文件：{config_path}")
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"加载配置文件 {config_path} 失败，已使用默认配置。错误信息：{e}")
+        default_config = MCQQConfig()
+        default_data = (
+            json.loads(default_config.model_dump_json())
+            if PYDANTIC_V2
+            else json.loads(default_config.json())
+        )
+        with primary.open("w", encoding="utf-8") as file:
+            yaml.safe_dump(default_data, file, allow_unicode=True, sort_keys=False)
+        logger.info(f"MCQQ 插件已在 {primary} 自动生成默认配置文件")
+    except Exception as error:  # noqa: BLE001
+        logger.error(f"生成默认配置文件失败：{error}")
+    return primary
+
+
+def _raw_env_mapping(raw_config: Any) -> dict[str, Any]:
+    if isinstance(raw_config, Mapping):
+        return dict(raw_config)
+    if isinstance(raw_config, BaseModel):
+        return _model_dump(raw_config, exclude_unset=True)
+    if hasattr(raw_config, "model_dump"):
+        return dict(raw_config.model_dump(exclude_unset=True))
+    if hasattr(raw_config, "dict"):
+        return dict(raw_config.dict(exclude_unset=True))
+    return {}
+
+
+def _load_env_overrides() -> dict[str, Any]:
+    try:
+        raw_config = getattr(get_driver().config, "mc_qq", None)
+        overrides = deepcopy(_raw_env_mapping(raw_config))
+        if not overrides:
+            return {}
+        _validate_mcqq_config({**_model_dump(MCQQConfig()), **overrides})
+    except Exception as error:  # noqa: BLE001
+        logger.error(f"NoneBot/env 的 mc_qq 配置无效，已忽略：{error}")
+        return {}
+
+    logger.info(
+        "MCQQ 插件已固定加载 NoneBot/env 顶层覆盖项：" + ", ".join(sorted(overrides))
+    )
+    return overrides
+
+
+def _require_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    msg = "YAML 根节点必须是对象"
+    raise TypeError(msg)
+
+
+def _load_effective_config(path: Path) -> MCQQConfig:
+    default_data = _model_dump(MCQQConfig())
+    try:
+        with path.open(encoding="utf-8") as file:
+            yaml_data = yaml.safe_load(file) or {}
+        config = _validate_mcqq_config(
+            {**dict(_require_mapping(yaml_data)), **_env_overrides}
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.error(f"加载配置文件 {path} 失败，已使用默认配置。错误信息：{error}")
+        try:
+            return _validate_mcqq_config({**default_data, **_env_overrides})
+        except Exception:  # noqa: BLE001  # pragma: no cover
+            logger.exception("应用 MCQQ 默认配置和 env 覆盖失败，已忽略 env 覆盖")
+            return MCQQConfig()
+
+    logger.info(f"MCQQ 插件成功加载配置文件：{path}")
+    return config
+
+
+config_path = _resolve_config_path()
+_env_overrides = _load_env_overrides()
+plugin_config = _load_effective_config(config_path)
+_startup_command_values = {
+    field_name: deepcopy(getattr(plugin_config, field_name))
+    for field_name in STARTUP_COMMAND_FIELDS
+}
+_restart_warning_values: dict[str, Any] = {}
+
 
 @dataclass(frozen=True, slots=True)
 class _ExternalSensitiveWords:
@@ -594,8 +662,125 @@ def _publish_sensitive_words(
     return True
 
 
+def _changed_fields(old: MCQQConfig, new: MCQQConfig) -> set[str]:
+    field_names = (
+        type(old).model_fields if PYDANTIC_V2 else type(old).__fields__  # pyright: ignore[reportAttributeAccessIssue]
+    )
+    return {
+        field_name
+        for field_name in field_names
+        if getattr(old, field_name) != getattr(new, field_name)
+    }
+
+
+def _preserve_startup_commands(candidate: MCQQConfig) -> None:
+    newly_changed_fields: list[str] = []
+    for field_name in STARTUP_COMMAND_FIELDS:
+        requested_value = getattr(candidate, field_name)
+        startup_value = _startup_command_values[field_name]
+        if requested_value == startup_value:
+            _restart_warning_values.pop(field_name, None)
+            continue
+
+        if (
+            field_name not in _restart_warning_values
+            or _restart_warning_values[field_name] != requested_value
+        ):
+            _restart_warning_values[field_name] = deepcopy(requested_value)
+            newly_changed_fields.append(field_name)
+        setattr(candidate, field_name, deepcopy(startup_value))
+
+    if newly_changed_fields:
+        logger.warning(
+            "以下命令配置需重启后生效，本次热重载已保留当前值："
+            + ", ".join(sorted(newly_changed_fields))
+        )
+
+
+def _register_sensitive_word_file(path: str) -> None:
+    config_reload_service.register(
+        "mcqq-sensitive-words",
+        Path(path),
+        _reload_sensitive_word_file,
+    )
+
+
+async def _apply_reloaded_config(candidate: MCQQConfig) -> None:
+    _preserve_startup_commands(candidate)
+    changed = _changed_fields(plugin_config, candidate)
+    if not changed:
+        logger.debug("MCQQ 配置内容未发生有效变化，跳过热重载")
+        return
+
+    sensitive_changed = bool(changed & SENSITIVE_CONFIG_FIELDS)
+    sensitive_path_changed = "ignore_word_file" in changed
+    dispatcher_changed = bool(changed & DISPATCH_CONFIG_FIELDS)
+    server_mapping_changed = "server_dict" in changed
+
+    sensitive_candidate: _SensitiveWordCandidate | None = None
+    if sensitive_changed:
+        sensitive_candidate = _prepare_sensitive_words(
+            candidate,
+            reload_external=sensitive_path_changed,
+            prewarm_phonetic=True,
+        )
+        if sensitive_candidate is None:
+            # 其他配置仍可热更新，但敏感字段必须和旧过滤器保持一致。
+            for field_name in SENSITIVE_CONFIG_FIELDS:
+                setattr(
+                    candidate,
+                    field_name,
+                    deepcopy(getattr(plugin_config, field_name)),
+                )
+            changed = _changed_fields(plugin_config, candidate)
+            sensitive_changed = False
+            sensitive_path_changed = False
+            dispatcher_changed = bool(changed & DISPATCH_CONFIG_FIELDS)
+            server_mapping_changed = "server_dict" in changed
+            if not changed:
+                logger.warning("敏感词候选构建失败，本次配置热重载未生效")
+                return
+
+    replace_model_state(plugin_config, candidate)
+
+    if sensitive_candidate is not None:
+        _commit_sensitive_words(sensitive_candidate)
+    if sensitive_path_changed:
+        _register_sensitive_word_file(plugin_config.ignore_word_file)
+    if server_mapping_changed:
+        from .bot_manage import rebuild_server_mappings
+
+        rebuild_server_mappings()
+    if dispatcher_changed:
+        from .utils.send_to_qq import reconfigure_dispatcher
+
+        await reconfigure_dispatcher()
+
+    logger.info("MCQQ 配置热重载成功，变更项：" + ", ".join(sorted(changed)))
+
+
+async def _reload_mcqq_config(_path: Path) -> None:
+    await _apply_reloaded_config(_load_effective_config(config_path))
+
+
+def _reload_sensitive_word_file(_path: Path) -> None:
+    configured_path = _normalized_sensitive_word_path(plugin_config.ignore_word_file)
+    if _path.resolve(strict=False) != configured_path:
+        logger.debug(f"忽略旧敏感词路径的延迟事件：{_path}")
+        return
+    if _publish_sensitive_words(
+        plugin_config,
+        reload_external=True,
+        preserve_on_external_error=True,
+        prewarm_phonetic=True,
+    ):
+        logger.info("敏感词文件热重载成功")
+
+
 _publish_sensitive_words(
     plugin_config,
     reload_external=True,
     prewarm_phonetic=False,
 )
+config_reload_service.register("mcqq-yaml", config_path, _reload_mcqq_config)
+_register_sensitive_word_file(plugin_config.ignore_word_file)

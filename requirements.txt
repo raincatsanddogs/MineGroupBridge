@@ -5,4 +5,5 @@ nonebot-adapter-qq>=1.7.1
 PyYAML>=6.0.3
 Pillow>=10.0.0
 pypinyin>=0.55.0
+watchfiles>=1.2.0
 nb-cli>=1.7.4

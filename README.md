@@ -52,6 +52,27 @@ ignore_word_replacements:
 同一个词在两处配置时，`mc_qq.yaml` 的映射优先。敏感词只处理 MC→QQ
 的文字；成就图片内部文字不会被修改。
 
+## 配置热重载
+
+运行时会使用系统文件事件监听启动时选定的 `mc_qq.yaml`、
+`render.yaml`（通常位于 `config/`），以及 `ignore_word_file` 当前指向的
+敏感词 JSON。监听器不进行定时轮询；相同内容的重复文件事件也不会触发
+配置更新，运行中也不会在根目录配置与 `config/` 配置之间自动切换。
+
+除 `command_header`、`command_priority`、`command_block` 外，YAML
+配置在保存后自动生效。上述命令 Matcher 配置以及 `.env`、`.env.*`
+仍需重启进程。通过 NoneBot/env 提供的 `mc_qq` 顶层字段会在启动时固定，
+并持续覆盖 YAML 中的同名顶层字段。
+
+`advancements.json`、资源包 ZIP 等渲染数据文件不在监听范围内，修改后同样
+需要重启。
+
+YAML 缺失、格式错误或校验失败时会应用默认配置。敏感词 JSON 热重载失败时
+保留该路径上一份有效词库和过滤器；首次启动或切换到尚无有效快照的新路径时，
+仅使用 YAML 词条。删除 JSON 文件会清空外部词表，但不影响 YAML 词条。
+限流队列中已经完成过滤的消息不会因词表热载而重新处理，新词表只作用于之后
+进入队列的消息。
+
 ## 使用和参考
 
 本项目直接使用了：[17TheWord/nonebot-plugin-mcqq](https://github.com/17TheWord/nonebot-plugin-mcqq)的代码

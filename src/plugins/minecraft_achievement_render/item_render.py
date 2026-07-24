@@ -11,6 +11,7 @@ from PIL import Image, ImageChops, ImageDraw
 
 from .resources import (
     ItemIconSpec,
+    get_component_asset_version,
     load_base_item_image,
     load_component_texture,
     load_light_item_image,
@@ -79,7 +80,7 @@ POTION_COLORS: dict[str, int] = {
     "decay": 0x736156,
 }
 
-_glint_cache: OrderedDict[tuple[str, int], Image.Image] = OrderedDict()
+_glint_cache: OrderedDict[tuple[str, str, int], Image.Image] = OrderedDict()
 
 CuboidSpec = tuple[
     tuple[float, float, float],
@@ -621,7 +622,7 @@ def _render_glint(image: Image.Image, glint_texture: Image.Image) -> Image.Image
 
 
 async def _load_glint(prefix: str) -> Image.Image | None:
-    cache_key = (prefix, id(load_component_texture))
+    cache_key = (prefix, get_component_asset_version(), id(load_component_texture))
     cached = _glint_cache.get(cache_key)
     if cached is not None:
         _glint_cache.move_to_end(cache_key)

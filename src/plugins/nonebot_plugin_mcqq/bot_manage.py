@@ -23,6 +23,34 @@ def _append_mapping(
         target_dict[target_id].append(server_id)
 
 
+def _add_server_mappings(server_id: str, server: Server) -> None:
+    for group in server.group_list:
+        if group.adapter == "qq":
+            _append_mapping(QQ_GROUP_SERVER_DICT, group.group_id, server_id)
+        elif group.adapter == "onebot":
+            _append_mapping(ONEBOT_GROUP_SERVER_DICT, group.group_id, server_id)
+
+    for guild in server.guild_list:
+        if guild.adapter == "qq":
+            _append_mapping(QQ_GUILD_SERVER_DICT, guild.channel_id, server_id)
+
+
+def rebuild_server_mappings() -> None:
+    """Rebuild inbound mappings for currently connected Minecraft servers."""
+
+    ONEBOT_GROUP_SERVER_DICT.clear()
+    QQ_GROUP_SERVER_DICT.clear()
+    QQ_GUILD_SERVER_DICT.clear()
+
+    for bot in get_bots().values():
+        if not isinstance(bot, MinecraftBot):
+            continue
+        server_id = str(bot.self_id)
+        server = plugin_config.server_dict.get(server_id)
+        if server is not None:
+            _add_server_mappings(server_id, server)
+
+
 @driver.on_bot_connect
 async def on_bot_connected(bot: MinecraftBot) -> None:
     """当 Minecraft 服务器连接成功时"""
@@ -35,16 +63,7 @@ async def on_bot_connected(bot: MinecraftBot) -> None:
 
     logger.info(f"[MC_QQ]丨服务器 {bot.self_id} 已成功连接。")
 
-    # 建立映射
-    for group in server.group_list:
-        if group.adapter == "qq":
-            _append_mapping(QQ_GROUP_SERVER_DICT, group.group_id, bot.self_id)
-        elif group.adapter == "onebot":
-            _append_mapping(ONEBOT_GROUP_SERVER_DICT, group.group_id, bot.self_id)
-
-    for guild in server.guild_list:
-        if guild.adapter == "qq":
-            _append_mapping(QQ_GUILD_SERVER_DICT, guild.channel_id, bot.self_id)
+    _add_server_mappings(str(bot.self_id), server)
     if plugin_config.notice_connected:
         await notify_groups(server, bot.self_id, connected=True)
 

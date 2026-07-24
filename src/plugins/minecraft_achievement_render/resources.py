@@ -36,11 +36,6 @@ LIGHT_ASSET_ROOT = (
     "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/"
     f"{LIGHT_ASSET_VERSION}/assets/minecraft/textures/item/"
 )
-COMPONENT_ASSET_VERSION = plugin_config.component_asset_version
-COMPONENT_ASSET_ROOT = (
-    "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/"
-    f"{COMPONENT_ASSET_VERSION}/assets/minecraft/textures/"
-)
 MOJANG_NAME_URL = "https://api.mojang.com/users/profiles/minecraft/{name}"
 MOJANG_PROFILE_URL = (
     "https://sessionserver.mojang.com/session/minecraft/profile/{uuid}?unsigned=true"
@@ -123,7 +118,7 @@ class MojangRateLimiter:
 mojang_rate_limiter = MojangRateLimiter()
 
 _resource_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
-_component_cache: OrderedDict[str, Image.Image] = OrderedDict()
+_component_cache: OrderedDict[tuple[str, str], Image.Image] = OrderedDict()
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -361,6 +356,12 @@ def _normalize_texture_path(texture_path: str) -> str | None:
     return value
 
 
+def get_component_asset_version() -> str:
+    """Return the currently active vanilla component texture version."""
+
+    return plugin_config.component_asset_version
+
+
 async def load_component_texture(
     texture_path: str,
     prefix: str = "",
@@ -376,22 +377,28 @@ async def load_component_texture(
         logger.warning(f"无效的组件纹理路径: {texture_path}")
         return None
 
-    cached = _component_cache.get(normalized_path)
+    version = get_component_asset_version()
+    cache_key = (version, normalized_path)
+    cached = _component_cache.get(cache_key)
     if cached is not None:
-        _component_cache.move_to_end(normalized_path)
+        _component_cache.move_to_end(cache_key)
         return cached
 
-    cache_path = CACHE_DIR / "component_assets" / Path(normalized_path)
-    url = f"{prefix}{COMPONENT_ASSET_ROOT}{normalized_path}"
+    cache_path = CACHE_DIR / "component_assets" / version / Path(normalized_path)
+    component_asset_root = (
+        "https://raw.githubusercontent.com/InventivetalentDev/minecraft-assets/"
+        f"{version}/assets/minecraft/textures/"
+    )
+    url = f"{prefix}{component_asset_root}{normalized_path}"
     image = await _load_cached_image(
         cache_path,
         url,
-        f"component:{normalized_path}",
+        f"component:{version}:{normalized_path}",
     )
     if image is None:
         return None
-    _component_cache[normalized_path] = image
-    _component_cache.move_to_end(normalized_path)
+    _component_cache[cache_key] = image
+    _component_cache.move_to_end(cache_key)
     if len(_component_cache) > COMPONENT_CACHE_SIZE:
         _component_cache.popitem(last=False)
     return image
@@ -641,6 +648,7 @@ async def resolve_player_skin(profile: object) -> Image.Image | None:
 __all__ = [
     "ItemIconSpec",
     "MojangRateLimiter",
+    "get_component_asset_version",
     "get_icon_spec",
     "load_base_item_image",
     "load_component_texture",

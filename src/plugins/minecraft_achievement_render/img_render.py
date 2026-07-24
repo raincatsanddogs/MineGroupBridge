@@ -150,10 +150,12 @@ async def render_achievement_to_bytes(
     description: str | None,
     achi_type: str | None = "task",
     key: str | None = "minecraft:story/root",
-    res_path_prefix: str = plugin_config.res_path_prefix,
+    res_path_prefix: str | None = None,
 ) -> bytes:
     """Render a Minecraft achievement card as transparent PNG bytes."""
 
+    if res_path_prefix is None:
+        res_path_prefix = plugin_config.res_path_prefix
     title = title or "未知成就"
     description = description or "暂无描述"
     normalized_type = achi_type if achi_type in TITLE_COLORS else "task"
