@@ -1,4 +1,3 @@
-from nonebot import get_bots
 from nonebot.adapters.minecraft import (
     Event as MinecraftEvent,
 )
@@ -77,10 +76,10 @@ def all_msg_rule(
     bot: QQBot | OneBot | None = None,
 ) -> bool:
     """
-    检测绑定目标，过滤候选池 Bot 消息，并只允许首个在线 Bot 处理入站消息。
+    检测绑定目标、过滤候选池 Bot 消息，并允许任一候选 Bot 处理入站消息。
 
-    候选池过滤用于避免出站消息被同池其他 Bot 转回 MC；主 Bot 选择仅用于
-    防止多 Bot 同群时重复转发，不参与出站轮换。
+    多 Bot 同群时由 single_session 保证先到事件取得会话锁并负责转发，
+    其余并发副本被忽略，不再按配置顺序指定固定的入站主 Bot。
     """
     if isinstance(event, QQGroupMessageCreateEvent):
         is_bound = event.group_openid in QQ_GROUP_SERVER_DICT
@@ -103,17 +102,14 @@ def all_msg_rule(
     if event.get_user_id() in candidate_bot_ids:
         return False
 
-    bots = get_bots()
-    for bot_id in candidate_bot_ids:
-        candidate = bots.get(bot_id)
-        if (
-            isinstance(event, OneBotGroupMessageEvent) and isinstance(candidate, OneBot)
-        ) or (
+    bot_id = str(bot.self_id)
+    return bot_id in candidate_bot_ids and (
+        (isinstance(event, OneBotGroupMessageEvent) and isinstance(bot, OneBot))
+        or (
             isinstance(event, (QQGroupMessageCreateEvent, QQGuildMessageEvent))
-            and isinstance(candidate, QQBot)
-        ):
-            return str(bot.self_id) == bot_id
-    return False
+            and isinstance(bot, QQBot)
+        )
+    )
 
 
 # TODO 优化以下代码，添加过期机制
