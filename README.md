@@ -19,6 +19,10 @@ pip install -r requirements.txt
 nb run
 ```
 
+## 群组at功能
+
+在minecraft发送` @[群组成员id] `，可以at群组成员，@和[群组成员id]之间可以有其他字符，@前需有空格。
+
 ## 敏感词过滤
 
 Minecraft 发往 QQ 的可见文本可在 `config/mc_qq.yaml` 中选择整条屏蔽或
@@ -29,8 +33,8 @@ ignore_word_file: "./src/mc_qq_ignore_word_list.json"
 ignore_word_mode: "replace"       # replace 或 block
 ignore_word_replacement: "***"    # 没有逐词映射时的默认值
 ignore_word_replacements:
-  "杀": "哈！"
-  "死": "猫"
+  "杀": "a"
+  "死": "b"
 ```
 
 映射键会自动加入敏感词库。替换模式支持全半角、大小写、跨空白以及带声调

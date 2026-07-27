@@ -21,6 +21,9 @@ from .sensitive_words import filter_current_sensitive_text
 MINUTE_SECONDS = 60.0
 HOUR_SECONDS = 3600.0
 DROP_LOG_INTERVAL_SECONDS = 10.0
+GROUP_MENTION_PATTERN = re.compile(
+    r" @[^\[\]\r\n]*?\[(?P<member_id>[^\s\[\]]+)\]"
+)
 
 TargetKind = Literal["group", "guild"]
 RouteKey = tuple[str, TargetKind, str, str]
@@ -33,6 +36,8 @@ class _PendingText:
 
     sequence: int
     text: str
+    parse_group_mentions: bool = False
+    has_group_mentions: bool = False
     force_plain: bool = False
 
 
@@ -122,6 +127,40 @@ class _BotSelection:
     bot: OneBot | QQBot | None
     online_count: int
     retry_after: float | None
+
+
+def _onebot_text_with_group_mentions(text: str) -> str | OneBotMessage:
+    matches = list(GROUP_MENTION_PATTERN.finditer(text))
+    if not matches:
+        return text
+
+    message = OneBotMessage()
+    cursor = 0
+    for match in matches:
+        if prefix := text[cursor : match.start()]:
+            message += OneBotMessageSegment.text(prefix)
+        message += OneBotMessageSegment.at(match.group("member_id"))
+        cursor = match.end()
+    if suffix := text[cursor:]:
+        message += OneBotMessageSegment.text(suffix)
+    return message
+
+
+def _qq_text_with_group_mentions(text: str) -> str | QQMessage:
+    matches = list(GROUP_MENTION_PATTERN.finditer(text))
+    if not matches:
+        return text
+
+    message = QQMessage()
+    cursor = 0
+    for match in matches:
+        if prefix := text[cursor : match.start()]:
+            message += QQMessageSegment.text(prefix)
+        message += QQMessageSegment.mention_user(match.group("member_id"))
+        cursor = match.end()
+    if suffix := text[cursor:]:
+        message += QQMessageSegment.text(suffix)
+    return message
 
 
 class _SendDispatcher:
@@ -349,7 +388,7 @@ class _SendDispatcher:
         self._remove_sequence_from_route_locked(route_key, sequence)
         self._record_drop_locked("达到全局上限")
 
-    def _enqueue_locked(self, route: _RouteState, text: str) -> bool:
+    def _enqueue_locked(self, route: _RouteState, text: str, *, parse_group_mentions: bool = False) -> bool:
         if not text:
             return False
 
@@ -362,7 +401,17 @@ class _SendDispatcher:
             self._drop_global_oldest_locked()
 
         self._sequence += 1
-        pending = _PendingText(sequence=self._sequence, text=text)
+        has_group_mentions = (
+            parse_group_mentions
+            and route.target_kind == "group"
+            and GROUP_MENTION_PATTERN.search(text) is not None
+        )
+        pending = _PendingText(
+            sequence=self._sequence,
+            text=text,
+            parse_group_mentions=parse_group_mentions,
+            has_group_mentions=has_group_mentions,
+        )
         route.pending.append(pending)
         self._global_pending[pending.sequence] = route.key
         self._ensure_worker_locked()
@@ -380,12 +429,22 @@ class _SendDispatcher:
         if not route.pending:
             return []
 
-        force_plain = route.pending[0].force_plain
+        first = route.pending[0]
+        batch_key = (
+            first.force_plain,
+            first.parse_group_mentions,
+            first.has_group_mentions,
+        )
         batch: list[_PendingText] = []
         while (
             route.pending
             and len(batch) < plugin_config.send_batch_max_messages
-            and route.pending[0].force_plain == force_plain
+            and (
+                route.pending[0].force_plain,
+                route.pending[0].parse_group_mentions,
+                route.pending[0].has_group_mentions,
+            )
+            == batch_key
         ):
             pending = route.pending.popleft()
             self._global_pending.pop(pending.sequence, None)
@@ -435,12 +494,13 @@ class _SendDispatcher:
         img_bytes: bytes | None,
         *,
         queue_when_limited: bool,
+        parse_group_mentions: bool = False,
     ) -> None:
         async with route.send_lock:
             async with self._state_lock:
                 if route.pending:
                     if queue_when_limited:
-                        queued = self._enqueue_locked(route, text)
+                        queued = self._enqueue_locked(route, text, parse_group_mentions=parse_group_mentions)
                         if queued and img_bytes:
                             logger.debug(
                                 f"[MC_QQ]丨路由 {route.target_id} 已有积压，"
@@ -462,7 +522,7 @@ class _SendDispatcher:
                     if selection.online_count and selection.retry_after is not None:
                         if queue_when_limited:
                             async with self._state_lock:
-                                queued = self._enqueue_locked(route, text)
+                                queued = self._enqueue_locked(route, text, parse_group_mentions=parse_group_mentions,)
                             if queued and img_bytes:
                                 logger.debug(
                                     f"[MC_QQ]丨路由 {route.target_id} 已达到频率限制，"
@@ -492,6 +552,7 @@ class _SendDispatcher:
                         route,
                         text,
                         img_bytes,
+                        parse_group_mentions=parse_group_mentions,
                     )
                 except Exception as error:  # noqa: BLE001
                     attempted_bot_ids.add(bot_id)
@@ -502,56 +563,118 @@ class _SendDispatcher:
                 else:
                     return
 
-    async def _send_immediate_api(  # noqa: PLR0912
+    @staticmethod
+    async def _send_onebot_group_api(
+        bot: OneBot,
+        route: _RouteState,
+        text: str,
+        img_bytes: bytes | None,
+        *,
+        parse_group_mentions: bool,
+    ) -> None:
+        rendered_text: str | OneBotMessage = text
+        if parse_group_mentions:
+            rendered_text = _onebot_text_with_group_mentions(text)
+        if img_bytes:
+            if isinstance(rendered_text, OneBotMessage):
+                message = rendered_text
+            else:
+                message = OneBotMessage()
+                if rendered_text:
+                    message += OneBotMessageSegment.text(rendered_text)
+            message += OneBotMessageSegment.image(img_bytes)
+        else:
+            message = rendered_text
+        await bot.send_group_msg(
+            group_id=int(route.target_id),
+            message=message,
+        )
+
+    @staticmethod
+    async def _send_qq_group_api(
+        bot: QQBot,
+        route: _RouteState,
+        text: str,
+        img_bytes: bytes | None,
+        *,
+        parse_group_mentions: bool,
+    ) -> None:
+        rendered_text: str | QQMessage = text
+        if parse_group_mentions:
+            rendered_text = _qq_text_with_group_mentions(text)
+        if img_bytes:
+            if isinstance(rendered_text, QQMessage):
+                message = rendered_text
+            else:
+                message = QQMessage()
+                if rendered_text:
+                    message += QQMessageSegment.text(rendered_text)
+            message += QQMessageSegment.file_image(img_bytes)
+            await bot.send_to_group(
+                group_openid=route.target_id,
+                message=message,
+            )
+        elif isinstance(rendered_text, QQMessage):
+            await bot.send_to_group(
+                group_openid=route.target_id,
+                message=rendered_text,
+            )
+        else:
+            await bot.post_group_messages(
+                group_openid=route.target_id,
+                msg_type=0,
+                content=rendered_text,
+            )
+
+    @staticmethod
+    async def _send_qq_channel_api(
+        bot: QQBot,
+        route: _RouteState,
+        text: str,
+        img_bytes: bytes | None,
+    ) -> None:
+        if img_bytes:
+            message: str | QQMessage = QQMessage()
+            if text:
+                message += QQMessageSegment.text(text)
+            message += QQMessageSegment.file_image(img_bytes)
+        else:
+            message = text
+        await bot.send_to_channel(
+            channel_id=route.target_id,
+            message=message,
+        )
+
+    async def _send_immediate_api(
         self,
         bot: OneBot | QQBot,
         route: _RouteState,
         text: str,
         img_bytes: bytes | None,
+        *,
+        parse_group_mentions: bool = False,
     ) -> None:
         try:
             if isinstance(bot, OneBot):
-                if img_bytes:
-                    message = OneBotMessage()
-                    if text:
-                        message += OneBotMessageSegment.text(text)
-                    message += OneBotMessageSegment.image(img_bytes)
-                else:
-                    message = text
-                await bot.send_group_msg(
-                    group_id=int(route.target_id),
-                    message=message,
+                await self._send_onebot_group_api(
+                    bot,
+                    route,
+                    text,
+                    img_bytes,
+                    parse_group_mentions=parse_group_mentions,
                 )
                 return
 
             if route.target_kind == "group":
-                if img_bytes:
-                    message = QQMessage()
-                    if text:
-                        message += QQMessageSegment.text(text)
-                    message += QQMessageSegment.file_image(img_bytes)
-                    await bot.send_to_group(
-                        group_openid=route.target_id,
-                        message=message,
-                    )
-                else:
-                    await bot.post_group_messages(
-                        group_openid=route.target_id,
-                        msg_type=0,
-                        content=text,
-                    )
-            else:
-                if img_bytes:
-                    message = QQMessage()
-                    if text:
-                        message += QQMessageSegment.text(text)
-                    message += QQMessageSegment.file_image(img_bytes)
-                else:
-                    message = text
-                await bot.send_to_channel(
-                    channel_id=route.target_id,
-                    message=message,
+                await self._send_qq_group_api(
+                    bot,
+                    route,
+                    text,
+                    img_bytes,
+                    parse_group_mentions=parse_group_mentions,
                 )
+            else:
+                await self._send_qq_channel_api(bot, route, text, img_bytes)
         except AuditException as error:
             await self._handle_audit(error, route)
 
@@ -619,8 +742,10 @@ class _SendDispatcher:
         bot: OneBot | QQBot,
         route: _RouteState,
         text: str,
+        *,
+        parse_group_mentions: bool,
     ) -> None:
-        await self._send_immediate_api(bot, route, text, None)
+        await self._send_immediate_api(bot, route, text, None, parse_group_mentions=parse_group_mentions)
 
     async def _attempt_plain_batch(
         self,
@@ -629,6 +754,7 @@ class _SendDispatcher:
     ) -> tuple[DeliveryStatus, float | None]:
         attempted_bot_ids: set[str] = set()
         text = self._plain_batch_text(route, batch)
+        parse_group_mentions = batch[0].parse_group_mentions
 
         while True:
             selection = await self._reserve_for_batch(route, attempted_bot_ids)
@@ -653,6 +779,7 @@ class _SendDispatcher:
                     selection.bot,
                     route,
                     text,
+                    parse_group_mentions=parse_group_mentions,
                 )
             except Exception as error:  # noqa: BLE001
                 attempted_bot_ids.add(bot_id)
@@ -673,6 +800,7 @@ class _SendDispatcher:
             and route.target_kind == "group"
             and len(batch) > 1
             and not batch[0].force_plain
+            and not batch[0].has_group_mentions
         )
         if not should_forward:
             return await self._attempt_plain_batch(route, batch)
@@ -787,6 +915,7 @@ async def send_mc_msg_to_qq(
     img_bytes: bytes | None = None,
     *,
     queue_when_limited: bool = True,
+    parse_group_mentions: bool = False,
 ) -> None:
     """发送 MC 消息；时效性事件可禁止在限流时进入待发队列。"""
     server = plugin_config.server_dict.get(server_name)
@@ -813,6 +942,7 @@ async def send_mc_msg_to_qq(
             msg_result,
             img_bytes,
             queue_when_limited=queue_when_limited,
+            parse_group_mentions=parse_group_mentions,
         )
 
 
