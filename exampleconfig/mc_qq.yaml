@@ -9,6 +9,13 @@ ignore_word_replacement: "***"
 ignore_word_replacements:
   "杀": "哈！"
   "死": "猫"
+# 每个词可覆盖全局处理模式；replace 未写 replacement 时按上方映射、全局值回退
+ignore_word_rules:
+  "a":
+    mode: "replace"
+    replacement: "c"
+  "b":
+    mode: "block"
 command_priority: 98
 command_block: true
 notice_connected: false

@@ -22,9 +22,18 @@ class _NormalizedText:
 
 
 @dataclass(frozen=True, slots=True)
+class SensitiveWordRule:
+    """单个敏感词对全局模式和替换文本的可选覆盖。"""
+
+    mode: str
+    replacement: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class _WordPattern:
     literal: str
     has_han: bool
+    mode: str
     replacement: str
     order: int
 
@@ -41,6 +50,7 @@ class _Match:
     source_end: int
     pattern_length: int
     exact: bool
+    mode: str
     replacement: str
     order: int
 
@@ -132,12 +142,12 @@ def _to_match_tokens(literal: str) -> tuple[_Token, ...]:
 
 
 def _normalize_text(text: str, *, keep_source_indices: bool) -> _NormalizedText:
-    """规范化文本；替换模式才保存规范化字符到原文位置的映射。"""
+    """规范化文本；需要选择或替换命中时保存规范化字符到原文位置的映射。"""
     if text.isascii() and not any(character.isspace() for character in text):
         return _NormalizedText(
             literal=text.casefold(),
             # 空元组表示规范化位置与原文位置完全相同，避免为常见 ASCII
-            # 消息分配逐字符位置表；None 则表示 block 模式无需位置。
+            # 消息分配逐字符位置表；None 表示纯 block 过滤器无需位置。
             source_indices=() if keep_source_indices else None,
         )
 
@@ -162,36 +172,47 @@ def _normalize_text(text: str, *, keep_source_indices: bool) -> _NormalizedText:
 def _ordered_words(
     words: Collection[str],
     replacements: Mapping[str, str],
+    rules: Mapping[str, SensitiveWordRule],
 ) -> tuple[str, ...]:
-    """映射按声明顺序优先，未映射的旧词库使用稳定字典序。"""
+    """逐词规则、替换映射按声明顺序优先，普通词使用稳定字典序。"""
+    ruled_words = [word for word in rules if isinstance(word, str) and word.strip()]
+    ruled_word_set = set(ruled_words)
     mapped_words = [
-        word for word in replacements if isinstance(word, str) and word.strip()
+        word for word in replacements if isinstance(word, str) and word.strip() and word not in ruled_word_set
     ]
-    mapped_word_set = set(mapped_words)
+    configured_word_set = ruled_word_set | set(mapped_words)
     plain_words = sorted(
         word
         for word in words
-        if isinstance(word, str) and word.strip() and word not in mapped_word_set
+        if isinstance(word, str) and word.strip() and word not in configured_word_set
     )
-    return *mapped_words, *plain_words
+    return *ruled_words, *mapped_words, *plain_words
 
 
 def _compile_patterns(
     ordered_words: tuple[str, ...],
     replacement_items: tuple[tuple[str, str], ...],
+    rule_items: tuple[tuple[str, SensitiveWordRule], ...],
+    default_mode: str,
     default_replacement: str,
 ) -> tuple[_WordPattern, ...]:
     replacement_map = dict(replacement_items)
+    rule_map = dict(rule_items)
     patterns: list[_WordPattern] = []
     for order, word in enumerate(ordered_words):
         normalized = _normalize_text(word, keep_source_indices=False)
         if not normalized.literal:
             continue
+        rule = rule_map.get(word)
+        replacement = replacement_map.get(word, default_replacement)
+        if rule is not None and rule.replacement is not None:
+            replacement = rule.replacement
         patterns.append(
             _WordPattern(
                 literal=normalized.literal,
                 has_han=_contains_han(normalized.literal),
-                replacement=replacement_map.get(word, default_replacement),
+                mode=rule.mode if rule is not None else default_mode,
+                replacement=replacement,
                 order=order,
             )
         )
@@ -244,8 +265,8 @@ def _source_span(
     end: int,
 ) -> tuple[int, int]:
     source_indices = normalized_text.source_indices
-    if source_indices is None:  # pragma: no cover - 仅替换模式调用
-        msg = "replace mode requires source indices"
+    if source_indices is None:  # pragma: no cover - 仅候选收集路径调用
+        msg = "match selection requires source indices"
         raise RuntimeError(msg)
     if not source_indices:
         return start, end
@@ -268,6 +289,7 @@ def _append_match(  # noqa: PLR0913
             source_end=source_end,
             pattern_length=len(pattern.literal),
             exact=exact,
+            mode=pattern.mode,
             replacement=pattern.replacement,
             order=pattern.order,
         )
@@ -364,28 +386,41 @@ class SensitiveWordFilter:
 
     patterns: tuple[_WordPattern, ...]
     exact_index: Mapping[str, tuple[_WordPattern, ...]]
-    mode: str
+    block_only: bool
     phonetic_index: _LazyPhoneticIndex | None
 
     @classmethod
-    def build(
+    def build(  # noqa: PLR0913
         cls,
         words: Collection[str],
         replacements: Mapping[str, str],
         *,
         mode: str,
         default_replacement: str,
+        rules: Mapping[str, SensitiveWordRule] | None = None,
         prewarm_phonetic: bool = False,
     ) -> SensitiveWordFilter:
-        ordered_words = _ordered_words(words, replacements)
+        valid_rules = {
+            word: rule
+            for word, rule in (rules or {}).items()
+            if isinstance(word, str)
+            and word.strip()
+            and isinstance(rule, SensitiveWordRule)
+            and rule.mode in {"block", "replace"}
+            and (rule.replacement is None or isinstance(rule.replacement, str))
+        }
+        ordered_words = _ordered_words(words, replacements, valid_rules)
         replacement_items = tuple(
             (word, replacement)
             for word, replacement in replacements.items()
             if isinstance(word, str) and word.strip() and isinstance(replacement, str)
         )
+        rule_items = tuple(valid_rules.items())
         patterns = _compile_patterns(
             ordered_words,
             replacement_items,
+            rule_items,
+            mode,
             default_replacement,
         )
         han_patterns = tuple(pattern for pattern in patterns if pattern.has_han)
@@ -393,26 +428,26 @@ class SensitiveWordFilter:
         matcher = cls(
             patterns=patterns,
             exact_index=_build_exact_index(patterns),
-            mode=mode,
+            block_only=bool(patterns)
+            and all(pattern.mode == "block" for pattern in patterns),
             phonetic_index=phonetic_index,
         )
         if prewarm_phonetic and phonetic_index is not None:
             phonetic_index.get()
         return matcher
 
-    def filter(self, text: str) -> str | None:
+    def filter(self, text: str) -> str | None:  # noqa: PLR0911
         if not text or not self.patterns:
             return text
 
-        block = self.mode == "block"
-        normalized_text = _normalize_text(text, keep_source_indices=not block)
+        normalized_text = _normalize_text(text, keep_source_indices=not self.block_only)
         if not normalized_text.literal:
             return text
 
         exact_matches = _find_exact_matches(
             normalized_text,
             self.exact_index,
-            block=block,
+            block=self.block_only,
         )
         if exact_matches is None:
             return None
@@ -422,7 +457,7 @@ class SensitiveWordFilter:
             phonetic_matches = _find_phonetic_matches(
                 normalized_text,
                 self.phonetic_index,
-                block=block,
+                block=self.block_only,
             )
             if phonetic_matches is None:
                 return None
@@ -432,6 +467,9 @@ class SensitiveWordFilter:
             return text
 
         selected = _select_matches(matches, len(text))
+        if any(match.mode == "block" for match in selected):
+            return None
+
         pieces: list[str] = []
         cursor = 0
         for match in selected:
@@ -448,15 +486,17 @@ class SensitiveWordRuntimeSnapshot:
 
     words: frozenset[str]
     replacements: tuple[tuple[str, str], ...]
+    rules: tuple[tuple[str, SensitiveWordRule], ...]
     matcher: SensitiveWordFilter
 
 
-def build_sensitive_runtime(
+def build_sensitive_runtime(  # noqa: PLR0913
     words: Collection[str],
     replacements: Mapping[str, str],
     *,
     mode: str,
     default_replacement: str,
+    rules: Mapping[str, SensitiveWordRule] | None = None,
     prewarm_phonetic: bool = False,
 ) -> SensitiveWordRuntimeSnapshot:
     valid_replacements = tuple(
@@ -464,18 +504,32 @@ def build_sensitive_runtime(
         for word, replacement in replacements.items()
         if isinstance(word, str) and word.strip() and isinstance(replacement, str)
     )
-    valid_words = frozenset(
-        word for word in words if isinstance(word, str) and word.strip()
-    ) | frozenset(word for word, _replacement in valid_replacements)
+    valid_rules = tuple(
+        (word, rule)
+        for word, rule in (rules or {}).items()
+        if isinstance(word, str)
+        and word.strip()
+        and isinstance(rule, SensitiveWordRule)
+        and rule.mode in {"block", "replace"}
+        and (rule.replacement is None or isinstance(rule.replacement, str))
+    )
+    valid_words = (
+        frozenset(word for word in words if isinstance(word, str) and word.strip())
+        | frozenset(word for word, _replacement in valid_replacements)
+        | frozenset(word for word, _rule in valid_rules)
+    )
     replacement_map = dict(valid_replacements)
+    rule_map = dict(valid_rules)
     return SensitiveWordRuntimeSnapshot(
         words=valid_words,
         replacements=valid_replacements,
+        rules=valid_rules,
         matcher=SensitiveWordFilter.build(
             valid_words,
             replacement_map,
             mode=mode,
             default_replacement=default_replacement,
+            rules=rule_map,
             prewarm_phonetic=prewarm_phonetic,
         ),
     )
@@ -484,7 +538,13 @@ def build_sensitive_runtime(
 _active_runtime = SensitiveWordRuntimeSnapshot(
     words=frozenset(),
     replacements=(),
-    matcher=SensitiveWordFilter((), MappingProxyType({}), "replace", None),
+    rules=(),
+    matcher=SensitiveWordFilter(
+        patterns=(),
+        exact_index=MappingProxyType({}),
+        block_only=False,
+        phonetic_index=None,
+    ),
 )
 
 
@@ -495,12 +555,13 @@ def publish_sensitive_runtime(snapshot: SensitiveWordRuntimeSnapshot) -> None:
     _active_runtime = snapshot
 
 
-def configure_sensitive_filter(
+def configure_sensitive_filter(  # noqa: PLR0913
     words: Collection[str],
     replacements: Mapping[str, str],
     *,
     mode: str,
     default_replacement: str,
+    rules: Mapping[str, SensitiveWordRule] | None = None,
     prewarm_phonetic: bool = False,
 ) -> None:
     """构建并原子发布过滤器，保留给测试和兼容调用方使用。"""
@@ -510,6 +571,7 @@ def configure_sensitive_filter(
             replacements,
             mode=mode,
             default_replacement=default_replacement,
+            rules=rules,
             prewarm_phonetic=prewarm_phonetic,
         )
     )
@@ -521,30 +583,33 @@ def filter_current_sensitive_text(text: str) -> str | None:
     return runtime.matcher.filter(text)
 
 
-def filter_sensitive_text(
+def filter_sensitive_text(  # noqa: PLR0913
     text: str,
     words: Collection[str],
     replacements: Mapping[str, str],
     *,
     mode: str,
     default_replacement: str,
+    rules: Mapping[str, SensitiveWordRule] | None = None,
 ) -> str | None:
     """
     过滤一段即将发往 QQ 的文本。
 
-    block 模式命中时返回 None；replace 模式返回替换后的文本。替换结果不会
-    再次参与匹配，避免自定义替换文本触发递归过滤。
+    最终选中的 block 命中返回 None，否则返回逐词替换后的文本。替换结果
+    不会再次参与匹配，避免自定义替换文本触发递归过滤。
     """
     return SensitiveWordFilter.build(
         words,
         replacements,
         mode=mode,
         default_replacement=default_replacement,
+        rules=rules,
     ).filter(text)
 
 
 __all__ = [
     "SensitiveWordFilter",
+    "SensitiveWordRule",
     "SensitiveWordRuntimeSnapshot",
     "build_sensitive_runtime",
     "configure_sensitive_filter",

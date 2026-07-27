@@ -35,6 +35,47 @@ DEFAULT_IGNORE_WORD_REPLACEMENT = "***"
 VALID_IGNORE_WORD_MODES = {"block", "replace"}
 
 
+def _collect_valid_rules(
+    raw_rules: Any,
+    source: str,
+) -> dict[str, dict[str, str | None]]:
+    """校验逐词模式覆盖；缺少替换文本时由后续优先级决定回退值。"""
+    if not isinstance(raw_rules, Mapping):
+        if raw_rules:
+            logger.warning(f"{source} 的逐词规则必须是对象，已忽略")
+        return {}
+
+    rules: dict[str, dict[str, str | None]] = {}
+    for word, raw_rule in raw_rules.items():
+        if not isinstance(word, str) or not word.strip():
+            logger.warning(f"{source} 中存在空词或非字符串规则键，已忽略")
+            continue
+        if not isinstance(raw_rule, Mapping):
+            logger.warning(f"{source} 中 {word!r} 的逐词规则必须是对象，已忽略")
+            continue
+
+        raw_mode = raw_rule.get("mode")
+        if (
+            not isinstance(raw_mode, str)
+            or raw_mode.strip().lower() not in VALID_IGNORE_WORD_MODES
+        ):
+            logger.warning(f"{source} 中 {word!r} 的逐词模式无效，已忽略")
+            continue
+
+        rule: dict[str, str | None] = {"mode": raw_mode.strip().lower()}
+        replacement = raw_rule.get("replacement")
+        if replacement is not None:
+            if isinstance(replacement, str):
+                rule["replacement"] = replacement
+            else:
+                logger.warning(
+                    f"{source} 中 {word!r} 的逐词替换值不是字符串，"
+                    "已回退到旧替换映射或全局替换值"
+                )
+        rules[word] = rule
+    return rules
+
+
 class Guild(BaseModel):
     """频道配置"""
 
@@ -95,6 +136,13 @@ class Server(BaseModel):
     """OneBot 合并转发消息的首个提示节点，空字符串表示关闭。"""
 
 
+class SensitiveWordRuleConfig(BaseModel):
+    """一个敏感词的逐词处理模式覆盖。"""
+
+    mode: str
+    replacement: str | None = None
+
+
 class MCQQConfig(BaseModel):
     """配置"""
 
@@ -118,6 +166,9 @@ class MCQQConfig(BaseModel):
 
     ignore_word_replacements: dict[str, str] = Field(default_factory=dict)
     """敏感词到替换文本的逐词映射；映射键会自动加入敏感词列表。"""
+
+    ignore_word_rules: dict[str, SensitiveWordRuleConfig] = Field(default_factory=dict)
+    """敏感词到处理模式的逐词规则；规则键会自动加入敏感词列表。"""
 
     command_priority: int = 98
     """命令优先级，1-98，消息优先级=命令优先级 - 1"""
@@ -274,6 +325,18 @@ class MCQQConfig(BaseModel):
         return replacements
 
     @(
+        field_validator("ignore_word_rules", mode="before")
+        if PYDANTIC_V2
+        else validator("ignore_word_rules", pre=True, always=True)
+    )
+    @classmethod
+    def validate_ignore_word_rules(
+        cls,
+        v: Any,
+    ) -> dict[str, dict[str, str | None]]:
+        return _collect_valid_rules(v, "mc_qq.yaml")
+
+    @(
         field_validator("command_priority", mode="before")
         if PYDANTIC_V2
         else validator("command_priority", pre=True, always=True)
@@ -333,6 +396,7 @@ SENSITIVE_CONFIG_FIELDS = frozenset(
         "ignore_word_mode",
         "ignore_word_replacement",
         "ignore_word_replacements",
+        "ignore_word_rules",
     }
 )
 DISPATCH_CONFIG_FIELDS = frozenset(
@@ -456,6 +520,7 @@ class _ExternalSensitiveWords:
     path: Path
     words: tuple[str, ...]
     replacements: tuple[tuple[str, str], ...]
+    rules: tuple[tuple[str, str, str | None], ...]
 
 
 _last_valid_external_words: _ExternalSensitiveWords | None = None
@@ -516,7 +581,7 @@ def _read_external_sensitive_words(path: Path) -> _ExternalSensitiveWords:
     """读取一个完整 JSON 候选；格式错误由调用方决定是否回退。"""
     if not path.exists():
         logger.info(f"敏感词文件不存在，按空外部词库处理：{path}")
-        return _ExternalSensitiveWords(path, (), ())
+        return _ExternalSensitiveWords(path, (), (), ())
 
     with path.open(encoding="utf-8") as file:
         json_data = json.load(file)
@@ -529,40 +594,69 @@ def _read_external_sensitive_words(path: Path) -> _ExternalSensitiveWords:
         json_data.get("replacements", {}),
         "敏感词 JSON",
     )
+    json_rules = _collect_valid_rules(
+        json_data.get("rules", {}),
+        "敏感词 JSON",
+    )
     logger.info(
         "加载敏感词文件成功，"
-        f"普通词数量为 {len(json_words)}，逐词映射数量为 {len(json_replacements)}"
+        f"普通词数量为 {len(json_words)}，逐词映射数量为 {len(json_replacements)}，"
+        f"逐词规则数量为 {len(json_rules)}"
     )
     return _ExternalSensitiveWords(
         path=path,
         words=tuple(json_words),
         replacements=tuple(json_replacements.items()),
+        rules=tuple(
+            (
+                word,
+                str(rule["mode"]),
+                rule.get("replacement"),
+            )
+            for word, rule in json_rules.items()
+        ),
     )
 
 
 def _merge_sensitive_words(
     mcqq_config: MCQQConfig,
     external_words: _ExternalSensitiveWords | None,
-) -> tuple[set[str], dict[str, str]]:
-    """合并 YAML 与已校验 JSON；YAML 的逐词映射拥有更高优先级。"""
+) -> tuple[
+    set[str],
+    dict[str, str],
+    dict[str, SensitiveWordRuleConfig],
+]:
+    """合并 YAML 与已校验 JSON；YAML 的同类逐词配置拥有更高优先级。"""
     words = set(_collect_valid_words(mcqq_config.ignore_word_list, "mc_qq.yaml"))
     replacements = dict(mcqq_config.ignore_word_replacements)
+    rules = dict(mcqq_config.ignore_word_rules)
     words.update(replacements)
+    words.update(rules)
 
     if external_words is None:
-        return words, replacements
+        return words, replacements, rules
 
     words.update(external_words.words)
     words.update(word for word, _replacement in external_words.replacements)
+    words.update(word for word, _mode, _replacement in external_words.rules)
     # setdefault 保证 YAML 中同名映射覆盖 JSON，同时保留两边的声明顺序。
     for word, replacement in external_words.replacements:
         replacements.setdefault(word, replacement)
-    return words, replacements
+    for word, mode, replacement in external_words.rules:
+        rules.setdefault(
+            word,
+            SensitiveWordRuleConfig(mode=mode, replacement=replacement),
+        )
+    return words, replacements, rules
 
 
 def _load_sensitive_words(
     mcqq_config: MCQQConfig,
-) -> tuple[set[str], dict[str, str]]:
+) -> tuple[
+    set[str],
+    dict[str, str],
+    dict[str, SensitiveWordRuleConfig],
+]:
     """兼容的独立加载入口；失败时返回 YAML 词库且不改变运行时缓存。"""
     path = _normalized_sensitive_word_path(mcqq_config.ignore_word_file)
     try:
@@ -586,7 +680,7 @@ def _prepare_sensitive_words(
     JSON 文件事件解析失败时直接保留上一运行态；YAML 启动或切换到一个尚无
     有效快照的新路径时，则安全地退回 YAML 词库。
     """
-    from .utils.sensitive_words import build_sensitive_runtime
+    from .utils.sensitive_words import SensitiveWordRule, build_sensitive_runtime
 
     path = _normalized_sensitive_word_path(mcqq_config.ignore_word_file)
     cached_external = _last_valid_external_words
@@ -607,13 +701,24 @@ def _prepare_sensitive_words(
     else:
         external_words = cached_external
 
-    words, replacements = _merge_sensitive_words(mcqq_config, external_words)
+    words, replacements, rules = _merge_sensitive_words(
+        mcqq_config,
+        external_words,
+    )
     try:
+        runtime_rules = {
+            word: SensitiveWordRule(
+                mode=rule.mode,
+                replacement=rule.replacement,
+            )
+            for word, rule in rules.items()
+        }
         runtime = build_sensitive_runtime(
             words,
             replacements,
             mode=mcqq_config.ignore_word_mode,
             default_replacement=mcqq_config.ignore_word_replacement,
+            rules=runtime_rules,
             prewarm_phonetic=prewarm_phonetic,
         )
     except Exception:  # noqa: BLE001

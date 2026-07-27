@@ -25,8 +25,8 @@ nb run
 
 ## 敏感词过滤
 
-Minecraft 发往 QQ 的可见文本可在 `config/mc_qq.yaml` 中选择整条屏蔽或
-逐词替换：
+Minecraft 发往 QQ 的可见文本可在 `config/mc_qq.yaml` 中设置全局处理模式，
+并按词覆盖为整条屏蔽或逐词替换：
 
 ```yaml
 ignore_word_file: "./src/mc_qq_ignore_word_list.json"
@@ -35,13 +35,22 @@ ignore_word_replacement: "***"    # 没有逐词映射时的默认值
 ignore_word_replacements:
   "杀": "a"
   "死": "b"
+ignore_word_rules:
+  "a":
+    mode: "replace"
+    replacement: "c"
+  "b":
+    mode: "block"
 ```
 
-映射键会自动加入敏感词库。替换模式支持全半角、大小写、跨空白以及带声调
-的中文同音字匹配；例如“沙”和“杀”同为 `sha1`，会采用“杀”的映射，
-“啥（sha2）”则不会命中。多音字按照词组上下文确定读音。
+规则键和映射键都会自动加入敏感词库。没有逐词规则时继续使用
+`ignore_word_mode`；逐词 `replace` 没有填写 `replacement` 时，依次使用
+`ignore_word_replacements` 中的同词映射和 `ignore_word_replacement`。
+替换模式支持全半角、大小写、跨空白以及带声调的中文同音字匹配；例如“沙”
+和“杀”同为 `sha1`，会采用“杀”的映射，“啥（sha2）”则不会命中。
+多音字按照词组上下文确定读音。
 
-外部 JSON 词库继续使用 `ignore_word_file`，并同时支持普通词和逐词映射：
+外部 JSON 词库继续使用 `ignore_word_file`，并同时支持普通词、逐词映射和规则：
 
 ```json
 {
@@ -49,12 +58,22 @@ ignore_word_replacements:
   "replacements": {
     "杀": "哈！",
     "死": "猫"
+  },
+  "rules": {
+    "a": {
+      "mode": "replace",
+      "replacement": "c"
+    },
+    "b": {
+      "mode": "block"
+    }
   }
 }
 ```
 
-同一个词在两处配置时，`mc_qq.yaml` 的映射优先。敏感词只处理 MC→QQ
-的文字；成就图片内部文字不会被修改。
+同一个词在两处配置时，`mc_qq.yaml` 中的同类逐词配置优先。若一条消息
+最终选中的命中包含 `block` 规则，整条消息都不会发出。敏感词只处理
+MC→QQ 的文字；成就图片内部文字不会被修改。
 
 ## 配置热重载
 
