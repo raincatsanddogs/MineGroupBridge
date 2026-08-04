@@ -294,6 +294,9 @@ class MCQQConfig(BaseModel):
     mc_to_qq_max_media_per_message: int = Field(default=4, ge=1)
     """单条 Minecraft 消息最多转换的远程媒体标记数量。"""
 
+    mc_to_qq_rich_media_timeout: int = Field(default=10, ge=1, le=60)
+    """OneBot 远程富媒体 API 调用的超时秒数。"""
+
     chat_upgrade_media_url_template: str | None = None
     """chat-upgrade 私有媒体引用使用的全局 HTTP(S) URL 模板。"""
 

@@ -31,6 +31,7 @@ nb run
 ```yaml
 mc_to_qq_rich_media_enable: true
 mc_to_qq_max_media_per_message: 4
+mc_to_qq_rich_media_timeout: 10
 chat_upgrade_media_url_template: null
 ```
 
@@ -64,6 +65,12 @@ server_dict:
 转换后的 URL 交给 QQ/OneBot 后端获取。OneBot 可在一条消息中承载多个媒体；
 QQ 官方群会按媒体拆分为多次发送；QQ 频道只原生发送图片，音频和视频保留
 bracket 文本。拆分后的每次 API 调用分别计入机器人 RPM/RPH。
+
+同一路由最多允许 4 个发送并发，慢媒体不会阻塞后续普通聊天和通知。
+OneBot 富媒体调用默认 10 秒超时；超时后会跳过其余候选 Bot 的重复媒体尝试，
+立即发送 bracket 回退文本。可通过 `mc_to_qq_rich_media_timeout` 调整超时时间。
+QQ 官方适配器的审核结果在后台等待，不占用发送槽位。为避免队头阻塞，
+慢媒体可能晚于后续普通文本到达。
 
 该开关只影响 Minecraft→QQ；已有的 `chat_image_enable` 仍仅控制 QQ 图片转成
 Minecraft `CICode` 的反向链路。

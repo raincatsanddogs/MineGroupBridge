@@ -31,6 +31,7 @@ from .sensitive_words import filter_current_sensitive_text
 MINUTE_SECONDS = 60.0
 HOUR_SECONDS = 3600.0
 DROP_LOG_INTERVAL_SECONDS = 10.0
+ROUTE_SEND_CONCURRENCY = 4
 
 TargetKind = Literal["group", "guild"]
 RouteKey = tuple[str, TargetKind, str, str]
@@ -71,6 +72,22 @@ def _media_failure_context(payload: _OutboundPayload | None) -> str:
     return ", ".join(details)
 
 
+def _is_media_timeout(
+    error: Exception,
+    payload: _OutboundPayload | None,
+) -> bool:
+    error_text = str(error).casefold()
+    return bool(
+        payload is not None
+        and payload.has_media
+        and (
+            isinstance(error, TimeoutError)
+            or "timeout" in error_text
+            or "timed out" in error_text
+        )
+    )
+
+
 @dataclass(slots=True)
 class _PendingText:
     """低资源待发项：可保留远程 URL，但不持有本地图片字节。"""
@@ -97,7 +114,10 @@ class _RouteState:
     forward_batch_header: str
     pending: deque[_PendingText] = field(default_factory=deque)
     cursor: int = 0
-    send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    send_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(ROUTE_SEND_CONCURRENCY)
+    )
+    flushing: bool = False
     active: bool = True
 
     @property
@@ -409,6 +429,7 @@ class _SendDispatcher:
         self._state_lock = asyncio.Lock()
         self._wake_event = asyncio.Event()
         self._worker_task: asyncio.Task[None] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
         self._closing = False
         self._drop_counts: dict[str, int] = {}
         self._last_drop_log = 0.0
@@ -751,9 +772,9 @@ class _SendDispatcher:
         parse_group_mentions: bool = False,
         payload: _OutboundPayload | None = None,
     ) -> None:
-        async with route.send_lock:
+        async with route.send_slots:
             async with self._state_lock:
-                if route.pending:
+                if route.pending or (route.flushing and queue_when_limited):
                     if queue_when_limited:
                         queued = self._enqueue_locked(
                             route,
@@ -845,6 +866,12 @@ class _SendDispatcher:
                     )
                 except Exception as error:  # noqa: BLE001
                     attempted_bot_ids.add(bot_id)
+                    if _is_media_timeout(error, payload):
+                        attempted_bot_ids.update(route.bot_ids)
+                        logger.warning(
+                            f"[MC_QQ]丨Bot {bot_id} 获取远程媒体超时，"
+                            "跳过其余候选 Bot 并立即降级"
+                        )
                     logger.error(
                         f"[MC_QQ]丨Bot {bot_id} 发送至 {route.target_id} "
                         f"出现异常：{error!r}"
@@ -879,10 +906,17 @@ class _SendDispatcher:
             message += OneBotMessageSegment.image(img_bytes)
         else:
             message = rendered_text
-        await bot.send_group_msg(
+        send_call = bot.send_group_msg(
             group_id=int(route.target_id),
             message=message,
         )
+        if payload is not None and payload.has_media:
+            await asyncio.wait_for(
+                send_call,
+                timeout=plugin_config.mc_to_qq_rich_media_timeout,
+            )
+        else:
+            await send_call
 
     @staticmethod
     async def _send_qq_group_api(  # noqa: PLR0913
@@ -1002,7 +1036,19 @@ class _SendDispatcher:
                     payload=payload,
                 )
         except AuditException as error:
-            await self._handle_audit(error, route)
+            self._schedule_audit_result(error, route)
+
+    def _schedule_audit_result(
+        self,
+        error: AuditException,
+        route: _RouteState,
+    ) -> None:
+        task = asyncio.create_task(
+            self._handle_audit(error, route),
+            name=f"mcqq-audit-{route.target_id}",
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     @staticmethod
     async def _handle_audit(
@@ -1158,6 +1204,12 @@ class _SendDispatcher:
                     )
             except Exception as error:  # noqa: BLE001
                 attempted_bot_ids.add(bot_id)
+                if _is_media_timeout(error, payload):
+                    attempted_bot_ids.update(route.bot_ids)
+                    logger.warning(
+                        f"[MC_QQ]丨Bot {bot_id} 获取积压远程媒体超时，"
+                        "跳过其余候选 Bot 并立即降级"
+                    )
                 logger.error(
                     f"[MC_QQ]丨Bot {bot_id} 发送纯文本批次至 "
                     f"{route.target_id} 出现异常：{error!r}"
@@ -1210,13 +1262,19 @@ class _SendDispatcher:
         self,
         route: _RouteState,
     ) -> tuple[bool, float | None]:
-        async with route.send_lock:
+        async with route.send_slots:
             async with self._state_lock:
                 batch = self._take_batch_locked(route)
+                if batch:
+                    route.flushing = True
             if not batch:
                 return False, None
 
-            status, retry_after = await self._deliver_queued_batch(route, batch)
+            try:
+                status, retry_after = await self._deliver_queued_batch(route, batch)
+            finally:
+                async with self._state_lock:
+                    route.flushing = False
             if status == "defer":
                 async with self._state_lock:
                     self._requeue_front_locked(route, batch)
@@ -1275,6 +1333,13 @@ class _SendDispatcher:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+        background_tasks = tuple(self._background_tasks)
+        for background_task in background_tasks:
+            background_task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
 
         async with self._state_lock:
             self._global_pending.clear()
