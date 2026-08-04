@@ -30,7 +30,7 @@ async def handle_mc_msg(event: PlayerChatEvent) -> None:
     suffix = username_way[1] if len(username_way) > 1 else ""
     formatted_nickname = f"{prefix}{event.player.nickname}{suffix}"
     msg_text = formatted_nickname + plugin_config.say_way + message_text
-    await send_mc_msg_to_qq(event.server_name, msg_text, parse_group_mentions=True)
+    await send_mc_msg_to_qq(event.server_name, msg_text, parse_group_mentions=True, parse_rich_media=True)
 
 
 @on_mc_notice.handle()

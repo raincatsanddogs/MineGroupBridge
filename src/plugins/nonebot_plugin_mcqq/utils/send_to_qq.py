@@ -1,10 +1,10 @@
 import asyncio
-import re
 import time
 from collections import OrderedDict, deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Literal, cast
+from urllib.parse import urlsplit
 
 from nonebot import get_bots, get_driver, logger
 from nonebot.adapters.onebot.v11 import Bot as OneBot
@@ -16,29 +16,76 @@ from nonebot.adapters.qq import Message as QQMessage
 from nonebot.adapters.qq import MessageSegment as QQMessageSegment
 
 from ..config import BotRateLimit, Server, plugin_config  # noqa: TID252
+from .parse_mc_msg import (
+    GROUP_MENTION_PATTERN,
+    MediaPart,
+    MentionPart,
+    MessagePart,
+    TextPart,
+    clean_minecraft_formatting,
+    parse_mc_message,
+    replace_media_names,
+)
 from .sensitive_words import filter_current_sensitive_text
 
 MINUTE_SECONDS = 60.0
 HOUR_SECONDS = 3600.0
 DROP_LOG_INTERVAL_SECONDS = 10.0
-GROUP_MENTION_PATTERN = re.compile(
-    r" @[^\[\]\r\n]*?\[(?P<member_id>[^\s\[\]]+)\]"
-)
 
 TargetKind = Literal["group", "guild"]
 RouteKey = tuple[str, TargetKind, str, str]
 DeliveryStatus = Literal["sent", "defer", "drop"]
+MEDIA_LABELS = {"image": "图片", "audio": "音频", "video": "视频"}
+
+
+@dataclass(frozen=True, slots=True)
+class _OutboundPayload:
+    """一个实际 QQ API 调用对应的有序消息内容及失败回退。"""
+
+    parts: tuple[MessagePart, ...]
+    fallback_parts: tuple[MessagePart, ...] | None = None
+
+    @property
+    def has_media(self) -> bool:
+        return any(isinstance(part, MediaPart) for part in self.parts)
+
+    @property
+    def has_group_mentions(self) -> bool:
+        return any(isinstance(part, MentionPart) for part in self.parts)
+
+    def fallback(self) -> "_OutboundPayload | None":
+        if self.fallback_parts is None:
+            return None
+        return _OutboundPayload(self.fallback_parts)
+
+
+def _media_failure_context(payload: _OutboundPayload | None) -> str:
+    """Return log-safe media metadata without exposing paths or query strings."""
+    if payload is None:
+        return ""
+    details = []
+    for part in payload.parts:
+        if isinstance(part, MediaPart):
+            host = urlsplit(part.url).hostname or "未知主机"
+            details.append(f"{part.media_type}@{host}")
+    return ", ".join(details)
 
 
 @dataclass(slots=True)
 class _PendingText:
-    """低资源待发项：限流队列只保留文本，不持有图片字节。"""
+    """低资源待发项：可保留远程 URL，但不持有本地图片字节。"""
 
     sequence: int
     text: str
     parse_group_mentions: bool = False
     has_group_mentions: bool = False
     force_plain: bool = False
+    payload: _OutboundPayload | None = None
+    has_media: bool = False
+
+    @property
+    def structured(self) -> bool:
+        return self.payload is not None
 
 
 @dataclass(slots=True)
@@ -130,37 +177,225 @@ class _BotSelection:
 
 
 def _onebot_text_with_group_mentions(text: str) -> str | OneBotMessage:
-    matches = list(GROUP_MENTION_PATTERN.finditer(text))
-    if not matches:
+    parts = parse_mc_message(
+        text,
+        parse_group_mentions=True,
+        parse_rich_media=False,
+    )
+    if not any(isinstance(part, MentionPart) for part in parts):
         return text
-
-    message = OneBotMessage()
-    cursor = 0
-    for match in matches:
-        if prefix := text[cursor : match.start()]:
-            message += OneBotMessageSegment.text(prefix)
-        message += OneBotMessageSegment.at(match.group("member_id"))
-        cursor = match.end()
-    if suffix := text[cursor:]:
-        message += OneBotMessageSegment.text(suffix)
-    return message
+    return _render_onebot_parts(tuple(parts))
 
 
 def _qq_text_with_group_mentions(text: str) -> str | QQMessage:
-    matches = list(GROUP_MENTION_PATTERN.finditer(text))
-    if not matches:
+    parts = parse_mc_message(
+        text,
+        parse_group_mentions=True,
+        parse_rich_media=False,
+    )
+    if not any(isinstance(part, MentionPart) for part in parts):
         return text
+    return _render_qq_parts(tuple(parts), allow_mentions=True, allow_media=True)
 
-    message = QQMessage()
-    cursor = 0
-    for match in matches:
-        if prefix := text[cursor : match.start()]:
-            message += QQMessageSegment.text(prefix)
-        message += QQMessageSegment.mention_user(match.group("member_id"))
-        cursor = match.end()
-    if suffix := text[cursor:]:
-        message += QQMessageSegment.text(suffix)
+
+def _media_label(part: MediaPart) -> str:
+    return f"[{MEDIA_LABELS[part.media_type]}: {part.name}]" if part.name else ""
+
+
+def _parts_to_fallback_text(parts: tuple[MessagePart, ...]) -> str:
+    chunks: list[str] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            chunks.append(part.text)
+        elif isinstance(part, MentionPart):
+            chunks.append(part.raw)
+        else:
+            chunks.append(part.raw_fallback)
+    return "".join(chunks)
+
+
+def _fallback_parts(parts: tuple[MessagePart, ...]) -> tuple[MessagePart, ...]:
+    fallback: list[MessagePart] = []
+    for part in parts:
+        candidate: MessagePart = (
+            TextPart(part.raw_fallback) if isinstance(part, MediaPart) else part
+        )
+        if (
+            fallback
+            and isinstance(fallback[-1], TextPart)
+            and isinstance(candidate, TextPart)
+        ):
+            fallback[-1] = TextPart(fallback[-1].text + candidate.text)
+        else:
+            fallback.append(candidate)
+    return tuple(fallback)
+
+
+def _render_onebot_parts(parts: tuple[MessagePart, ...]) -> OneBotMessage:
+    message = OneBotMessage()
+    for part in parts:
+        if isinstance(part, TextPart):
+            if part.text:
+                message += OneBotMessageSegment.text(part.text)
+        elif isinstance(part, MentionPart):
+            message += OneBotMessageSegment.at(part.member_id)
+        else:
+            if label := _media_label(part):
+                message += OneBotMessageSegment.text(label)
+            if part.media_type == "image":
+                message += OneBotMessageSegment.image(part.url)
+            elif part.media_type == "audio":
+                message += OneBotMessageSegment.record(part.url)
+            else:
+                message += OneBotMessageSegment.video(part.url)
     return message
+
+
+def _render_qq_parts(  # noqa: C901
+    parts: tuple[MessagePart, ...],
+    *,
+    allow_mentions: bool,
+    allow_media: bool,
+) -> QQMessage:
+    message = QQMessage()
+    for part in parts:
+        if isinstance(part, TextPart):
+            if part.text:
+                message += QQMessageSegment.text(part.text)
+        elif isinstance(part, MentionPart):
+            if allow_mentions:
+                message += QQMessageSegment.mention_user(part.member_id)
+            elif part.raw:
+                message += QQMessageSegment.text(part.raw)
+        elif allow_media:
+            if label := _media_label(part):
+                message += QQMessageSegment.text(label)
+            if part.media_type == "image":
+                message += QQMessageSegment.image(part.url)
+            elif part.media_type == "audio":
+                message += QQMessageSegment.audio(part.url)
+            else:
+                message += QQMessageSegment.video(part.url)
+        else:
+            message += QQMessageSegment.text(part.raw_fallback)
+    return message
+
+
+def _coalesce_parts(parts: list[MessagePart]) -> tuple[MessagePart, ...]:
+    result: list[MessagePart] = []
+    for part in parts:
+        if (
+            result
+            and isinstance(result[-1], TextPart)
+            and isinstance(part, TextPart)
+        ):
+            result[-1] = TextPart(result[-1].text + part.text)
+        elif not isinstance(part, TextPart) or part.text:
+            result.append(part)
+    return tuple(result)
+
+
+def _payload_or_plain(
+    parts: tuple[MessagePart, ...],
+) -> tuple[str, _OutboundPayload | None]:
+    if not parts:
+        return "", None
+    if all(isinstance(part, TextPart) for part in parts):
+        return "".join(part.text for part in parts if isinstance(part, TextPart)), None
+    payload = _OutboundPayload(
+        parts,
+        _fallback_parts(parts)
+        if any(isinstance(part, MediaPart) for part in parts)
+        else None,
+    )
+    return _parts_to_fallback_text(parts), payload
+
+
+def _compile_route_payloads(
+    parts: tuple[MessagePart, ...],
+    route: _RouteState,
+) -> list[tuple[str, _OutboundPayload | None]]:
+    if route.adapter == "onebot":
+        text, payload = _payload_or_plain(parts)
+        return [(text, payload)] if text or payload is not None else []
+
+    units: list[tuple[str, _OutboundPayload | None]] = []
+    buffer: list[MessagePart] = []
+    for part in parts:
+        if isinstance(part, MentionPart) and route.target_kind != "group":
+            buffer.append(TextPart(part.raw))
+            continue
+        supported_media = isinstance(part, MediaPart) and (
+            route.target_kind == "group" or part.media_type == "image"
+        )
+        if not supported_media:
+            buffer.append(
+                TextPart(part.raw_fallback) if isinstance(part, MediaPart) else part
+            )
+            continue
+
+        buffer.append(part)
+        unit_parts = _coalesce_parts(buffer)
+        text, payload = _payload_or_plain(unit_parts)
+        units.append((text, payload))
+        buffer = []
+
+    if trailing := _coalesce_parts(buffer):
+        text, payload = _payload_or_plain(trailing)
+        if text or payload is not None:
+            units.append((text, payload))
+    return units
+
+
+def _filter_message_parts(
+    parts: list[MessagePart],
+) -> tuple[MessagePart, ...] | None:
+    """仅过滤最终可见字段；任一 block 命中即屏蔽整个逻辑消息。"""
+    filtered_parts: list[MessagePart] = []
+    for part in parts:
+        if isinstance(part, TextPart):
+            cleaned_text = clean_minecraft_formatting(part.text)
+            filtered_text = filter_current_sensitive_text(cleaned_text)
+            if filtered_text is None:
+                return None
+            if filtered_text:
+                filtered_parts.append(TextPart(filtered_text))
+            continue
+        if isinstance(part, MentionPart):
+            filtered_parts.append(part)
+            continue
+
+        filtered_names: list[str] = []
+        for name in part.name_values:
+            cleaned_name = clean_minecraft_formatting(name)
+            filtered_name = filter_current_sensitive_text(cleaned_name)
+            if filtered_name is None:
+                return None
+            filtered_names.append(filtered_name)
+        filtered_parts.append(replace_media_names(part, tuple(filtered_names)))
+    return _coalesce_parts(filtered_parts)
+
+
+def _parse_and_filter_message(
+    text: str,
+    server: Server,
+    *,
+    parse_group_mentions: bool,
+    parse_rich_media: bool,
+) -> tuple[MessagePart, ...] | None:
+    rich_media_enabled = parse_rich_media and plugin_config.mc_to_qq_rich_media_enable
+    media_template = (
+        server.chat_upgrade_media_url_template
+        or plugin_config.chat_upgrade_media_url_template
+    )
+    parts = parse_mc_message(
+        text,
+        parse_group_mentions=parse_group_mentions,
+        parse_rich_media=rich_media_enabled,
+        media_url_template=media_template,
+        media_limit=plugin_config.mc_to_qq_max_media_per_message,
+    )
+    return _filter_message_parts(parts)
 
 
 class _SendDispatcher:
@@ -388,8 +623,15 @@ class _SendDispatcher:
         self._remove_sequence_from_route_locked(route_key, sequence)
         self._record_drop_locked("达到全局上限")
 
-    def _enqueue_locked(self, route: _RouteState, text: str, *, parse_group_mentions: bool = False) -> bool:
-        if not text:
+    def _enqueue_locked(
+        self,
+        route: _RouteState,
+        text: str,
+        *,
+        parse_group_mentions: bool = False,
+        payload: _OutboundPayload | None = None,
+    ) -> bool:
+        if not text and payload is None:
             return False
 
         if len(route.pending) >= plugin_config.send_route_queue_max_messages:
@@ -402,15 +644,22 @@ class _SendDispatcher:
 
         self._sequence += 1
         has_group_mentions = (
-            parse_group_mentions
-            and route.target_kind == "group"
-            and GROUP_MENTION_PATTERN.search(text) is not None
+            route.target_kind == "group"
+            and (
+                (payload is not None and payload.has_group_mentions)
+                or (
+                    parse_group_mentions
+                    and GROUP_MENTION_PATTERN.search(text) is not None
+                )
+            )
         )
         pending = _PendingText(
             sequence=self._sequence,
             text=text,
             parse_group_mentions=parse_group_mentions,
             has_group_mentions=has_group_mentions,
+            payload=payload,
+            has_media=payload is not None and payload.has_media,
         )
         route.pending.append(pending)
         self._global_pending[pending.sequence] = route.key
@@ -434,15 +683,20 @@ class _SendDispatcher:
             first.force_plain,
             first.parse_group_mentions,
             first.has_group_mentions,
+            first.structured,
+            first.has_media,
         )
         batch: list[_PendingText] = []
         while (
             route.pending
-            and len(batch) < plugin_config.send_batch_max_messages
+            and len(batch)
+            < (1 if first.structured else plugin_config.send_batch_max_messages)
             and (
                 route.pending[0].force_plain,
                 route.pending[0].parse_group_mentions,
                 route.pending[0].has_group_mentions,
+                route.pending[0].structured,
+                route.pending[0].has_media,
             )
             == batch_key
         ):
@@ -487,7 +741,7 @@ class _SendDispatcher:
         self._ensure_worker_locked()
         self._wake_event.set()
 
-    async def dispatch(  # noqa: C901, PLR0912
+    async def dispatch(  # noqa: C901, PLR0912, PLR0913
         self,
         route: _RouteState,
         text: str,
@@ -495,12 +749,18 @@ class _SendDispatcher:
         *,
         queue_when_limited: bool,
         parse_group_mentions: bool = False,
+        payload: _OutboundPayload | None = None,
     ) -> None:
         async with route.send_lock:
             async with self._state_lock:
                 if route.pending:
                     if queue_when_limited:
-                        queued = self._enqueue_locked(route, text, parse_group_mentions=parse_group_mentions)
+                        queued = self._enqueue_locked(
+                            route,
+                            text,
+                            parse_group_mentions=parse_group_mentions,
+                            payload=payload,
+                        )
                         if queued and img_bytes:
                             logger.debug(
                                 f"[MC_QQ]丨路由 {route.target_id} 已有积压，"
@@ -514,6 +774,8 @@ class _SendDispatcher:
                     return
 
             attempted_bot_ids: set[str] = set()
+            fallback_used = False
+            media_failure_context = _media_failure_context(payload)
             while True:
                 async with self._state_lock:
                     selection = self._select_bot_locked(route, attempted_bot_ids)
@@ -522,7 +784,12 @@ class _SendDispatcher:
                     if selection.online_count and selection.retry_after is not None:
                         if queue_when_limited:
                             async with self._state_lock:
-                                queued = self._enqueue_locked(route, text, parse_group_mentions=parse_group_mentions,)
+                                queued = self._enqueue_locked(
+                                    route,
+                                    text,
+                                    parse_group_mentions=parse_group_mentions,
+                                    payload=payload,
+                                )
                             if queued and img_bytes:
                                 logger.debug(
                                     f"[MC_QQ]丨路由 {route.target_id} 已达到频率限制，"
@@ -533,10 +800,31 @@ class _SendDispatcher:
                                 f"[MC_QQ]丨路由 {route.target_id} 已达到频率限制，"
                                 "时效性消息已丢弃"
                             )
+                    elif (
+                        attempted_bot_ids
+                        and not fallback_used
+                        and payload is not None
+                        and (fallback := payload.fallback()) is not None
+                    ):
+                        logger.warning(
+                            f"[MC_QQ]丨发送至 {route.target_id} 的富媒体失败，"
+                            "仅回退该发送单元的原始 bracket 文本"
+                        )
+                        payload = fallback
+                        text = _parts_to_fallback_text(fallback.parts)
+                        parse_group_mentions = False
+                        attempted_bot_ids.clear()
+                        fallback_used = True
+                        continue
                     elif attempted_bot_ids:
+                        media_log = (
+                            f"；失败媒体：{media_failure_context}"
+                            if media_failure_context
+                            else ""
+                        )
                         logger.error(
                             f"[MC_QQ]丨发送至 {route.target_id} 失败，"
-                            "所有在线候选 Bot 均已尝试"
+                            f"所有在线候选 Bot 均已尝试{media_log}"
                         )
                     else:
                         logger.error(
@@ -553,6 +841,7 @@ class _SendDispatcher:
                         text,
                         img_bytes,
                         parse_group_mentions=parse_group_mentions,
+                        payload=payload,
                     )
                 except Exception as error:  # noqa: BLE001
                     attempted_bot_ids.add(bot_id)
@@ -564,17 +853,22 @@ class _SendDispatcher:
                     return
 
     @staticmethod
-    async def _send_onebot_group_api(
+    async def _send_onebot_group_api(  # noqa: PLR0913
         bot: OneBot,
         route: _RouteState,
         text: str,
         img_bytes: bytes | None,
         *,
         parse_group_mentions: bool,
+        payload: _OutboundPayload | None = None,
     ) -> None:
-        rendered_text: str | OneBotMessage = text
-        if parse_group_mentions:
+        rendered_text: str | OneBotMessage
+        if payload is not None:
+            rendered_text = _render_onebot_parts(payload.parts)
+        elif parse_group_mentions:
             rendered_text = _onebot_text_with_group_mentions(text)
+        else:
+            rendered_text = text
         if img_bytes:
             if isinstance(rendered_text, OneBotMessage):
                 message = rendered_text
@@ -591,17 +885,26 @@ class _SendDispatcher:
         )
 
     @staticmethod
-    async def _send_qq_group_api(
+    async def _send_qq_group_api(  # noqa: PLR0913
         bot: QQBot,
         route: _RouteState,
         text: str,
         img_bytes: bytes | None,
         *,
         parse_group_mentions: bool,
+        payload: _OutboundPayload | None = None,
     ) -> None:
-        rendered_text: str | QQMessage = text
-        if parse_group_mentions:
+        rendered_text: str | QQMessage
+        if payload is not None:
+            rendered_text = _render_qq_parts(
+                payload.parts,
+                allow_mentions=True,
+                allow_media=True,
+            )
+        elif parse_group_mentions:
             rendered_text = _qq_text_with_group_mentions(text)
+        else:
+            rendered_text = text
         if img_bytes:
             if isinstance(rendered_text, QQMessage):
                 message = rendered_text
@@ -632,20 +935,34 @@ class _SendDispatcher:
         route: _RouteState,
         text: str,
         img_bytes: bytes | None,
+        *,
+        payload: _OutboundPayload | None = None,
     ) -> None:
-        if img_bytes:
-            message: str | QQMessage = QQMessage()
+        if payload is not None:
+            message: str | QQMessage = _render_qq_parts(
+                payload.parts,
+                allow_mentions=False,
+                allow_media=True,
+            )
+        elif img_bytes:
+            message = QQMessage()
             if text:
                 message += QQMessageSegment.text(text)
-            message += QQMessageSegment.file_image(img_bytes)
         else:
             message = text
+        if img_bytes:
+            if not isinstance(message, QQMessage):
+                rendered = QQMessage()
+                if message:
+                    rendered += QQMessageSegment.text(message)
+                message = rendered
+            message += QQMessageSegment.file_image(img_bytes)
         await bot.send_to_channel(
             channel_id=route.target_id,
             message=message,
         )
 
-    async def _send_immediate_api(
+    async def _send_immediate_api(  # noqa: PLR0913
         self,
         bot: OneBot | QQBot,
         route: _RouteState,
@@ -653,6 +970,7 @@ class _SendDispatcher:
         img_bytes: bytes | None,
         *,
         parse_group_mentions: bool = False,
+        payload: _OutboundPayload | None = None,
     ) -> None:
         try:
             if isinstance(bot, OneBot):
@@ -662,6 +980,7 @@ class _SendDispatcher:
                     text,
                     img_bytes,
                     parse_group_mentions=parse_group_mentions,
+                    payload=payload,
                 )
                 return
 
@@ -672,9 +991,16 @@ class _SendDispatcher:
                     text,
                     img_bytes,
                     parse_group_mentions=parse_group_mentions,
+                    payload=payload,
                 )
             else:
-                await self._send_qq_channel_api(bot, route, text, img_bytes)
+                await self._send_qq_channel_api(
+                    bot,
+                    route,
+                    text,
+                    img_bytes,
+                    payload=payload,
+                )
         except AuditException as error:
             await self._handle_audit(error, route)
 
@@ -744,8 +1070,16 @@ class _SendDispatcher:
         text: str,
         *,
         parse_group_mentions: bool,
+        payload: _OutboundPayload | None = None,
     ) -> None:
-        await self._send_immediate_api(bot, route, text, None, parse_group_mentions=parse_group_mentions)
+        await self._send_immediate_api(
+            bot,
+            route,
+            text,
+            None,
+            parse_group_mentions=parse_group_mentions,
+            payload=payload,
+        )
 
     async def _attempt_plain_batch(
         self,
@@ -753,34 +1087,75 @@ class _SendDispatcher:
         batch: list[_PendingText],
     ) -> tuple[DeliveryStatus, float | None]:
         attempted_bot_ids: set[str] = set()
-        text = self._plain_batch_text(route, batch)
+        pending = batch[0]
+        payload = pending.payload if len(batch) == 1 else None
+        text = (
+            pending.text
+            if payload is not None
+            else self._plain_batch_text(route, batch)
+        )
         parse_group_mentions = batch[0].parse_group_mentions
+        fallback_used = payload is not None and payload.fallback_parts is None
+        media_failure_context = _media_failure_context(payload)
 
         while True:
             selection = await self._reserve_for_batch(route, attempted_bot_ids)
             if selection.bot is None:
                 if selection.online_count and selection.retry_after is not None:
                     return "defer", selection.retry_after
+                if (
+                    attempted_bot_ids
+                    and not fallback_used
+                    and payload is not None
+                    and (fallback := payload.fallback()) is not None
+                ):
+                    logger.warning(
+                        f"[MC_QQ]丨积压富媒体发送至 {route.target_id} 失败，"
+                        "仅回退该发送单元的原始 bracket 文本"
+                    )
+                    payload = fallback
+                    text = _parts_to_fallback_text(fallback.parts)
+                    pending.payload = fallback
+                    pending.text = text
+                    pending.has_media = False
+                    pending.force_plain = True
+                    attempted_bot_ids.clear()
+                    fallback_used = True
+                    continue
                 if attempted_bot_ids:
+                    media_log = (
+                        f"；失败媒体：{media_failure_context}"
+                        if media_failure_context
+                        else ""
+                    )
                     logger.error(
-                        f"[MC_QQ]丨纯文本批次发送至 {route.target_id} 失败，"
-                        "所有在线候选 Bot 均已尝试"
+                        f"[MC_QQ]丨消息批次发送至 {route.target_id} 失败，"
+                        f"所有在线候选 Bot 均已尝试{media_log}"
                     )
                 else:
                     logger.error(
-                        f"[MC_QQ]丨纯文本批次发送至 {route.target_id} 失败，"
+                        f"[MC_QQ]丨消息批次发送至 {route.target_id} 失败，"
                         "没有匹配且在线的候选 Bot"
                     )
                 return "drop", None
 
             bot_id = str(selection.bot.self_id)
             try:
-                await self._send_plain_batch_api(
-                    selection.bot,
-                    route,
-                    text,
-                    parse_group_mentions=parse_group_mentions,
-                )
+                if payload is None:
+                    await self._send_plain_batch_api(
+                        selection.bot,
+                        route,
+                        text,
+                        parse_group_mentions=parse_group_mentions,
+                    )
+                else:
+                    await self._send_plain_batch_api(
+                        selection.bot,
+                        route,
+                        text,
+                        parse_group_mentions=parse_group_mentions,
+                        payload=payload,
+                    )
             except Exception as error:  # noqa: BLE001
                 attempted_bot_ids.add(bot_id)
                 logger.error(
@@ -801,6 +1176,8 @@ class _SendDispatcher:
             and len(batch) > 1
             and not batch[0].force_plain
             and not batch[0].has_group_mentions
+            and not batch[0].structured
+            and not batch[0].has_media
         )
         if not should_forward:
             return await self._attempt_plain_batch(route, batch)
@@ -909,13 +1286,14 @@ class _SendDispatcher:
 _dispatcher = _SendDispatcher()
 
 
-async def send_mc_msg_to_qq(
+async def send_mc_msg_to_qq(  # noqa: PLR0913
     server_name: str,
     result: str,
     img_bytes: bytes | None = None,
     *,
     queue_when_limited: bool = True,
     parse_group_mentions: bool = False,
+    parse_rich_media: bool = False,
 ) -> None:
     """发送 MC 消息；时效性事件可禁止在限流时进入待发队列。"""
     server = plugin_config.server_dict.get(server_name)
@@ -923,27 +1301,47 @@ async def send_mc_msg_to_qq(
         logger.error(f"未知的服务器: {server_name}")
         return
 
-    msg_result = re.sub(r"[&§].", "", result)
+    msg_result = result
     if plugin_config.display_server_name:
         display_name = server.nickname or f"[{server_name}]"
         msg_result = f"{display_name} {msg_result}"
 
-    # 在最终可见文本进入限流队列前过滤，确保昵称、服务器名和通知同样生效。
-    filtered_result = filter_current_sensitive_text(msg_result)
-    if filtered_result is None:
+    parts = _parse_and_filter_message(
+        msg_result,
+        server,
+        parse_group_mentions=parse_group_mentions,
+        parse_rich_media=parse_rich_media,
+    )
+    if parts is None:
         logger.info(f"[MC_QQ]丨服务器 {server_name} 的消息命中敏感词，已屏蔽")
         return
-    msg_result = filtered_result
 
     routes = _dispatcher.routes_for_server(server_name, server)
     for route in routes:
-        await _dispatcher.dispatch(
-            route,
-            msg_result,
-            img_bytes,
-            queue_when_limited=queue_when_limited,
-            parse_group_mentions=parse_group_mentions,
+        units = (
+            _compile_route_payloads(parts, route)
+            if isinstance(route, _RouteState)
+            else [_payload_or_plain(parts)]
         )
+        for index, (unit_text, payload) in enumerate(units):
+            unit_image = img_bytes if index == len(units) - 1 else None
+            if payload is None:
+                await _dispatcher.dispatch(
+                    route,
+                    unit_text,
+                    unit_image,
+                    queue_when_limited=queue_when_limited,
+                    parse_group_mentions=parse_group_mentions,
+                )
+            else:
+                await _dispatcher.dispatch(
+                    route,
+                    unit_text,
+                    unit_image,
+                    queue_when_limited=queue_when_limited,
+                    parse_group_mentions=parse_group_mentions,
+                    payload=payload,
+                )
 
 
 async def reconfigure_dispatcher() -> None:

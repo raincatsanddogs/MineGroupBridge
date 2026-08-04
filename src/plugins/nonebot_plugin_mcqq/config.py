@@ -8,7 +8,9 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from string import Formatter
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import yaml
 from nonebot import get_driver, logger
@@ -33,6 +35,68 @@ MAX_COMMAND_PRIORITY = 98
 DEFAULT_IGNORE_WORD_MODE = "replace"
 DEFAULT_IGNORE_WORD_REPLACEMENT = "***"
 VALID_IGNORE_WORD_MODES = {"block", "replace"}
+MEDIA_TEMPLATE_FIELDS = {"media_id", "type"}
+URL_CONTROL_CHARACTER_PATTERN = {chr(code) for code in (*range(32), 127)}
+
+
+def _validate_media_template_preview(preview: str, source: str) -> None:
+    try:
+        parsed = urlsplit(preview)
+        hostname = parsed.hostname
+    except ValueError as error:
+        msg = f"{source} 格式化后不是合法 URL: {error}"
+        raise ValueError(msg) from error
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(character.isspace() for character in preview)
+        or any(character in URL_CONTROL_CHARACTER_PATTERN for character in preview)
+    ):
+        msg = f"{source} 格式化后必须是包含主机名的 HTTP(S) URL"
+        raise ValueError(msg)
+
+
+def _validate_media_url_template(value: Any, source: str) -> str | None:
+    """校验 chat-upgrade 私有媒体引用使用的 HTTP(S) URL 模板。"""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        msg = f"{source} 必须是字符串或 null"
+        raise TypeError(msg)
+
+    template = value.strip()
+    if not template:
+        return None
+    try:
+        fields = {
+            field_name
+            for _literal, field_name, format_spec, conversion in Formatter().parse(
+                template
+            )
+            if field_name is not None
+            if not format_spec and conversion is None
+        }
+        parsed_parts = list(Formatter().parse(template))
+    except ValueError as error:
+        msg = f"{source} 不是有效的格式化模板: {error}"
+        raise ValueError(msg) from error
+
+    for _literal, field_name, format_spec, conversion in parsed_parts:
+        if field_name is not None and (format_spec or conversion is not None):
+            msg = f"{source} 不支持格式说明符或转换标记"
+            raise ValueError(msg)
+    if "media_id" not in fields:
+        msg = f"{source} 必须包含 {{media_id}} 占位符"
+        raise ValueError(msg)
+    if unknown_fields := fields - MEDIA_TEMPLATE_FIELDS:
+        msg = f"{source} 包含未知占位符: {', '.join(sorted(unknown_fields))}"
+        raise ValueError(msg)
+
+    preview = template.format(media_id="preview", type="image")
+    _validate_media_template_preview(preview, source)
+    return template
 
 
 def _collect_valid_rules(
@@ -135,6 +199,21 @@ class Server(BaseModel):
     forward_batch_header: str = ""
     """OneBot 合并转发消息的首个提示节点，空字符串表示关闭。"""
 
+    chat_upgrade_media_url_template: str | None = None
+    """本服务器覆盖的 chat-upgrade 私有媒体 HTTP(S) URL 模板。"""
+
+    @(
+        field_validator("chat_upgrade_media_url_template", mode="before")
+        if PYDANTIC_V2
+        else validator("chat_upgrade_media_url_template", pre=True, always=True)
+    )
+    @classmethod
+    def validate_media_url_template(cls, value: Any) -> str | None:
+        return _validate_media_url_template(
+            value,
+            "server.chat_upgrade_media_url_template",
+        )
+
 
 class SensitiveWordRuleConfig(BaseModel):
     """一个敏感词的逐词处理模式覆盖。"""
@@ -208,6 +287,15 @@ class MCQQConfig(BaseModel):
 
     chat_image_enable: bool = False
     """是否启用 ChatImage MOD"""
+
+    mc_to_qq_rich_media_enable: bool = False
+    """是否解析 Minecraft 发往 QQ 的 CICode/ChatUpgrade 富媒体标记。"""
+
+    mc_to_qq_max_media_per_message: int = Field(default=4, ge=1)
+    """单条 Minecraft 消息最多转换的远程媒体标记数量。"""
+
+    chat_upgrade_media_url_template: str | None = None
+    """chat-upgrade 私有媒体引用使用的全局 HTTP(S) URL 模板。"""
 
     cmd_whitelist: set[str] = {"list", "tps", "banlist"}
     """命令白名单"""
@@ -335,6 +423,18 @@ class MCQQConfig(BaseModel):
         v: Any,
     ) -> dict[str, dict[str, str | None]]:
         return _collect_valid_rules(v, "mc_qq.yaml")
+
+    @(
+        field_validator("chat_upgrade_media_url_template", mode="before")
+        if PYDANTIC_V2
+        else validator("chat_upgrade_media_url_template", pre=True, always=True)
+    )
+    @classmethod
+    def validate_media_url_template(cls, value: Any) -> str | None:
+        return _validate_media_url_template(
+            value,
+            "chat_upgrade_media_url_template",
+        )
 
     @(
         field_validator("command_priority", mode="before")

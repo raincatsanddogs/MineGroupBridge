@@ -23,6 +23,51 @@ nb run
 
 在minecraft发送` @[群组成员id] `，可以at群组成员，@和[群组成员id]之间可以有其他字符，@前需有空格。
 
+## Minecraft → QQ 富媒体
+
+开启以下配置后，Minecraft 玩家聊天中的 `CICode` 和 `ChatUpgrade`
+标记会转换成 QQ 图片、音频或视频消息：
+
+```yaml
+mc_to_qq_rich_media_enable: true
+mc_to_qq_max_media_per_message: 4
+chat_upgrade_media_url_template: null
+```
+
+支持的格式如下。Tag 名和参数名不区分大小写，但不支持 `ChatUpdate`
+等其他拼写；参数值不支持逗号或引号转义。
+
+```text
+[[CICode,url=https://example.com/a.png,name=图片名称]]
+[[ChatUpgrade,url=https://example.com/a.png,name=图片名称,type=image]]
+[[ChatUpgrade,url=https://example.com/a.mp3,name=音频名称,type=audio]]
+[[ChatUpgrade,url=https://example.com/a.mp4,name=视频名称,type=video]]
+```
+
+`CICode` 始终按图片处理。`ChatUpgrade` 未填写 `type` 时，普通 HTTP(S)
+URL 默认按图片处理。无法解析、平台不支持或发送失败的媒体会恢复为原始
+bracket 文本；单条消息超过 `mc_to_qq_max_media_per_message` 的部分同样保留
+原文。
+
+对于 `chat-upgrade://media/<type>/<mediaId>` 私有引用，可配置 HTTP(S)
+转换模板：
+
+```yaml
+chat_upgrade_media_url_template: "https://media.example/{type}/{media_id}"
+server_dict:
+  my_minecraft_server:
+    # 服务器级配置优先于全局模板
+    chat_upgrade_media_url_template: "https://mc.example/media/{media_id}"
+```
+
+模板必须包含 `{media_id}`，可选 `{type}`。桥接器不会下载远程媒体，而是把
+转换后的 URL 交给 QQ/OneBot 后端获取。OneBot 可在一条消息中承载多个媒体；
+QQ 官方群会按媒体拆分为多次发送；QQ 频道只原生发送图片，音频和视频保留
+bracket 文本。拆分后的每次 API 调用分别计入机器人 RPM/RPH。
+
+该开关只影响 Minecraft→QQ；已有的 `chat_image_enable` 仍仅控制 QQ 图片转成
+Minecraft `CICode` 的反向链路。
+
 ## 敏感词过滤
 
 Minecraft 发往 QQ 的可见文本可在 `config/mc_qq.yaml` 中设置全局处理模式，

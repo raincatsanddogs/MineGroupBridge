@@ -29,6 +29,13 @@ guild_admin_roles:
   - 频道主
   - 超级管理员
 chat_image_enable: false
+# 是否解析 Minecraft→QQ 文本中的 CICode/ChatUpgrade 富媒体标记
+mc_to_qq_rich_media_enable: false
+# 单条 Minecraft 消息最多转换的远程媒体标记数量，超出部分保留原文
+mc_to_qq_max_media_per_message: 4
+# chat-upgrade://media/<type>/<mediaId> 的全局 HTTP(S) 转换模板
+# 必须包含 {media_id}，可选 {type}；普通 HTTP(S) 媒体不使用该模板
+chat_upgrade_media_url_template: null
 cmd_whitelist:
   - list
   - tps
@@ -48,6 +55,8 @@ send_global_queue_max_messages: 1000 # 所有路由合计积压上限
 server_dict:
   "my_minecraft_server":
     nickname: "我的Minecraft服务器" # 昵称
+    # 可选：覆盖上方全局 chat-upgrade 媒体 URL 模板
+    chat_upgrade_media_url_template: null
     # OneBot 合并转发的首个提示节点，留空可关闭
     forward_batch_header: "以下是达到发送频率限制后合并的消息："
     group_list:
