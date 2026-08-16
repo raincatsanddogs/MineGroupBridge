@@ -297,6 +297,9 @@ class MCQQConfig(BaseModel):
     mc_to_qq_rich_media_timeout: int = Field(default=10, ge=1, le=60)
     """OneBot 远程富媒体 API 调用的超时秒数。"""
 
+    mc_to_qq_rich_media_grace_seconds: int = Field(default=3, ge=0, le=60)
+    """OneBot 富媒体 API 主超时后继续等待发送结果的宽限秒数。"""
+
     chat_upgrade_media_url_template: str | None = None
     """chat-upgrade 私有媒体引用使用的全局 HTTP(S) URL 模板。"""
 

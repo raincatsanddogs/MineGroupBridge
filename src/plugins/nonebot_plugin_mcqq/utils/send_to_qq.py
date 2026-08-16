@@ -39,6 +39,13 @@ DeliveryStatus = Literal["sent", "defer", "drop"]
 MEDIA_LABELS = {"image": "图片", "audio": "音频", "video": "视频"}
 
 
+class _OneBotMediaConfirmationError(TimeoutError):
+    """OneBot 富媒体发送在主超时及宽限期内均未返回。"""
+
+    def __init__(self) -> None:
+        super().__init__("OneBot 富媒体发送等待确认超时")
+
+
 @dataclass(frozen=True, slots=True)
 class _OutboundPayload:
     """一个实际 QQ API 调用对应的有序消息内容及失败回退。"""
@@ -86,6 +93,82 @@ def _is_media_timeout(
             or "timed out" in error_text
         )
     )
+
+
+def _onebot_result_message_id(result: object) -> int | None:
+    """从 OneBot send_group_msg 返回结果中提取 message_id。"""
+    raw = result
+    if isinstance(result, dict):
+        raw = result.get("message_id") or result.get("message-id")
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
+
+
+async def _confirm_onebot_media_send(bot: OneBot, result: object) -> None:
+    """send_group_msg 已返回时，尽量用返回的 message_id 查证消息存在。
+
+    get_msg 只作为附加确认；实现不支持或查询失败时，仍以 send_group_msg
+    的成功返回为准，避免把已经发出的消息误判为失败而重复回退。
+    """
+    message_id = _onebot_result_message_id(result)
+    if plugin_config.mc_to_qq_rich_media_grace_seconds <= 0:
+        return
+    if message_id is None:
+        logger.debug(
+            "[MC_QQ]丨OneBot 富媒体结果未包含 message_id，"
+            "按 send_group_msg 返回成功处理"
+        )
+        return
+    try:
+        await asyncio.wait_for(
+            bot.get_msg(message_id=message_id),
+            timeout=plugin_config.mc_to_qq_rich_media_grace_seconds,
+        )
+    except Exception as error:  # noqa: BLE001
+        logger.debug(
+            "[MC_QQ]丨OneBot get_msg 验证未完成，"
+            f"仍以 send_group_msg 返回为准：{error!r}"
+        )
+
+
+async def _await_onebot_media_result(
+    send_task: asyncio.Task[object],
+) -> tuple[object, bool]:
+    """富媒体主超时后不立即降级，继续宽限等待 message_id 返回。
+
+    返回 ``(result, need_confirm)``；仅当主超时后才需要调用 get_msg 查证。
+    """
+    timeout = plugin_config.mc_to_qq_rich_media_timeout
+    grace = plugin_config.mc_to_qq_rich_media_grace_seconds
+    try:
+        return await asyncio.wait_for(asyncio.shield(send_task), timeout=timeout), False
+    except TimeoutError:
+        # wait_for 也会原样传播底层协程自己抛出的 TimeoutError。若任务已经
+        # 结束，直接读取其结果，避免把确定的适配器错误误判为外层主超时。
+        if send_task.done():
+            return send_task.result(), False
+        if grace <= 0:
+            raise
+        logger.debug(
+            f"[MC_QQ]丨OneBot 富媒体发送主超时，继续等待 {grace}s 以确认 message_id"
+        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(send_task),
+                timeout=grace,
+            )
+        except TimeoutError:
+            # 处理任务恰好在宽限边界结束的竞态；任务自身的 TimeoutError
+            # 也应保留原始异常，而不是被改写成“等待确认超时”。
+            if send_task.done():
+                return send_task.result(), True
+            raise _OneBotMediaConfirmationError from None
+        return result, True
 
 
 @dataclass(slots=True)
@@ -304,11 +387,7 @@ def _render_qq_parts(  # noqa: C901
 def _coalesce_parts(parts: list[MessagePart]) -> tuple[MessagePart, ...]:
     result: list[MessagePart] = []
     for part in parts:
-        if (
-            result
-            and isinstance(result[-1], TextPart)
-            and isinstance(part, TextPart)
-        ):
+        if result and isinstance(result[-1], TextPart) and isinstance(part, TextPart):
             result[-1] = TextPart(result[-1].text + part.text)
         elif not isinstance(part, TextPart) or part.text:
             result.append(part)
@@ -664,15 +743,9 @@ class _SendDispatcher:
             self._drop_global_oldest_locked()
 
         self._sequence += 1
-        has_group_mentions = (
-            route.target_kind == "group"
-            and (
-                (payload is not None and payload.has_group_mentions)
-                or (
-                    parse_group_mentions
-                    and GROUP_MENTION_PATTERN.search(text) is not None
-                )
-            )
+        has_group_mentions = route.target_kind == "group" and (
+            (payload is not None and payload.has_group_mentions)
+            or (parse_group_mentions and GROUP_MENTION_PATTERN.search(text) is not None)
         )
         pending = _PendingText(
             sequence=self._sequence,
@@ -795,7 +868,6 @@ class _SendDispatcher:
                     return
 
             attempted_bot_ids: set[str] = set()
-            fallback_used = False
             media_failure_context = _media_failure_context(payload)
             while True:
                 async with self._state_lock:
@@ -821,9 +893,10 @@ class _SendDispatcher:
                                 f"[MC_QQ]丨路由 {route.target_id} 已达到频率限制，"
                                 "时效性消息已丢弃"
                             )
-                    elif (
+                        return
+
+                    if (
                         attempted_bot_ids
-                        and not fallback_used
                         and payload is not None
                         and (fallback := payload.fallback()) is not None
                     ):
@@ -831,13 +904,34 @@ class _SendDispatcher:
                             f"[MC_QQ]丨发送至 {route.target_id} 的富媒体失败，"
                             "仅回退该发送单元的原始 bracket 文本"
                         )
-                        payload = fallback
-                        text = _parts_to_fallback_text(fallback.parts)
-                        parse_group_mentions = False
-                        attempted_bot_ids.clear()
-                        fallback_used = True
-                        continue
-                    elif attempted_bot_ids:
+                        fallback_text = _parts_to_fallback_text(fallback.parts)
+                        async with self._state_lock:
+                            fallback_selection = self._select_bot_locked(route, set())
+                        if fallback_selection.bot is None:
+                            logger.warning(
+                                f"[MC_QQ]丨发送至 {route.target_id} 的 bracket "
+                                "回退无可用 Bot，已丢弃该回退"
+                            )
+                            return
+
+                        fallback_bot_id = str(fallback_selection.bot.self_id)
+                        try:
+                            await self._send_immediate_api(
+                                fallback_selection.bot,
+                                route,
+                                fallback_text,
+                                None,
+                                parse_group_mentions=False,
+                                payload=fallback,
+                            )
+                        except Exception as error:  # noqa: BLE001
+                            logger.error(
+                                f"[MC_QQ]丨Bot {fallback_bot_id} 发送回退文本至 "
+                                f"{route.target_id} 出现异常：{error!r}"
+                            )
+                        return
+
+                    if attempted_bot_ids:
                         media_log = (
                             f"；失败媒体：{media_failure_context}"
                             if media_failure_context
@@ -869,8 +963,8 @@ class _SendDispatcher:
                     if _is_media_timeout(error, payload):
                         attempted_bot_ids.update(route.bot_ids)
                         logger.warning(
-                            f"[MC_QQ]丨Bot {bot_id} 获取远程媒体超时，"
-                            "跳过其余候选 Bot 并立即降级"
+                            f"[MC_QQ]丨Bot {bot_id} 富媒体发送确认超时，"
+                            "跳过其余候选 Bot 并降级"
                         )
                     logger.error(
                         f"[MC_QQ]丨Bot {bot_id} 发送至 {route.target_id} "
@@ -880,7 +974,7 @@ class _SendDispatcher:
                     return
 
     @staticmethod
-    async def _send_onebot_group_api(  # noqa: PLR0913
+    async def _send_onebot_group_api(  # noqa: PLR0912, PLR0913
         bot: OneBot,
         route: _RouteState,
         text: str,
@@ -911,10 +1005,16 @@ class _SendDispatcher:
             message=message,
         )
         if payload is not None and payload.has_media:
-            await asyncio.wait_for(
-                send_call,
-                timeout=plugin_config.mc_to_qq_rich_media_timeout,
-            )
+            send_task = asyncio.create_task(send_call)
+            try:
+                result, need_confirm = await _await_onebot_media_result(send_task)
+                if need_confirm:
+                    await _confirm_onebot_media_send(bot, result)
+            finally:
+                if not send_task.done():
+                    send_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
+                        await send_task
         else:
             await send_call
 
@@ -1127,7 +1227,7 @@ class _SendDispatcher:
             payload=payload,
         )
 
-    async def _attempt_plain_batch(
+    async def _attempt_plain_batch(  # noqa: C901, PLR0912
         self,
         route: _RouteState,
         batch: list[_PendingText],
@@ -1141,7 +1241,6 @@ class _SendDispatcher:
             else self._plain_batch_text(route, batch)
         )
         parse_group_mentions = batch[0].parse_group_mentions
-        fallback_used = payload is not None and payload.fallback_parts is None
         media_failure_context = _media_failure_context(payload)
 
         while True:
@@ -1151,7 +1250,6 @@ class _SendDispatcher:
                     return "defer", selection.retry_after
                 if (
                     attempted_bot_ids
-                    and not fallback_used
                     and payload is not None
                     and (fallback := payload.fallback()) is not None
                 ):
@@ -1159,15 +1257,37 @@ class _SendDispatcher:
                         f"[MC_QQ]丨积压富媒体发送至 {route.target_id} 失败，"
                         "仅回退该发送单元的原始 bracket 文本"
                     )
-                    payload = fallback
-                    text = _parts_to_fallback_text(fallback.parts)
+                    fallback_text = _parts_to_fallback_text(fallback.parts)
                     pending.payload = fallback
-                    pending.text = text
+                    pending.text = fallback_text
                     pending.has_media = False
                     pending.force_plain = True
-                    attempted_bot_ids.clear()
-                    fallback_used = True
-                    continue
+
+                    fallback_selection = await self._reserve_for_batch(route, set())
+                    if fallback_selection.bot is None:
+                        logger.warning(
+                            f"[MC_QQ]丨积压富媒体回退至 {route.target_id} "
+                            "无可用 Bot，已丢弃该回退"
+                        )
+                        return "drop", None
+
+                    fallback_bot_id = str(fallback_selection.bot.self_id)
+                    try:
+                        await self._send_plain_batch_api(
+                            fallback_selection.bot,
+                            route,
+                            fallback_text,
+                            parse_group_mentions=False,
+                            payload=fallback,
+                        )
+                    except Exception as error:  # noqa: BLE001
+                        logger.error(
+                            f"[MC_QQ]丨Bot {fallback_bot_id} 发送回退文本至 "
+                            f"{route.target_id} 出现异常：{error!r}"
+                        )
+                        return "drop", None
+                    else:
+                        return "sent", None
                 if attempted_bot_ids:
                     media_log = (
                         f"；失败媒体：{media_failure_context}"
@@ -1207,8 +1327,8 @@ class _SendDispatcher:
                 if _is_media_timeout(error, payload):
                     attempted_bot_ids.update(route.bot_ids)
                     logger.warning(
-                        f"[MC_QQ]丨Bot {bot_id} 获取积压远程媒体超时，"
-                        "跳过其余候选 Bot 并立即降级"
+                        f"[MC_QQ]丨Bot {bot_id} 积压富媒体发送确认超时，"
+                        "跳过其余候选 Bot 并降级"
                     )
                 logger.error(
                     f"[MC_QQ]丨Bot {bot_id} 发送纯文本批次至 "

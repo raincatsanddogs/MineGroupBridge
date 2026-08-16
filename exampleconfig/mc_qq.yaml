@@ -33,8 +33,10 @@ chat_image_enable: false
 mc_to_qq_rich_media_enable: false
 # 单条 Minecraft 消息最多转换的远程媒体标记数量，超出部分保留原文
 mc_to_qq_max_media_per_message: 4
-# OneBot 远程富媒体 API 超时秒数；超时后立即 bracket 回退
+# OneBot 富媒体 API 主超时秒数；超时后进入宽限等待
 mc_to_qq_rich_media_timeout: 10
+# 主超时后继续等待发送结果的宽限秒数；0 表示不等待
+mc_to_qq_rich_media_grace_seconds: 3
 # chat-upgrade://media/<type>/<mediaId> 的全局 HTTP(S) 转换模板
 # 必须包含 {media_id}，可选 {type}；普通 HTTP(S) 媒体不使用该模板
 chat_upgrade_media_url_template: null
