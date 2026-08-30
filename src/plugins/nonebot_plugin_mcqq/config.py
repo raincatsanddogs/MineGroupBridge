@@ -4,6 +4,7 @@
 
 import importlib.util
 import json
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -35,8 +36,29 @@ MAX_COMMAND_PRIORITY = 98
 DEFAULT_IGNORE_WORD_MODE = "replace"
 DEFAULT_IGNORE_WORD_REPLACEMENT = "***"
 VALID_IGNORE_WORD_MODES = {"block", "replace"}
+VALID_IGNORE_WORD_RULE_MODES = VALID_IGNORE_WORD_MODES | {"regdel", "regsel"}
 MEDIA_TEMPLATE_FIELDS = {"media_id", "type"}
 URL_CONTROL_CHARACTER_PATTERN = {chr(code) for code in (*range(32), 127)}
+
+
+def _validate_regex_rule(
+    pattern: str,
+    mode: str,
+    replacement: Any,
+    source: str,
+) -> tuple[bool, Any]:
+    if mode not in {"regdel", "regsel"}:
+        return True, replacement
+    try:
+        re.compile(pattern)
+    except re.error as error:
+        logger.warning(f"{source} 中正则规则 {pattern!r} 无效，已忽略：{error}")
+        return False, None
+    if replacement is not None:
+        logger.warning(
+            f"{source} 中正则规则 {pattern!r} 的 replacement 不生效，已忽略"
+        )
+    return True, None
 
 
 def _validate_media_template_preview(preview: str, source: str) -> None:
@@ -121,13 +143,21 @@ def _collect_valid_rules(
         raw_mode = raw_rule.get("mode")
         if (
             not isinstance(raw_mode, str)
-            or raw_mode.strip().lower() not in VALID_IGNORE_WORD_MODES
+            or raw_mode.strip().lower() not in VALID_IGNORE_WORD_RULE_MODES
         ):
             logger.warning(f"{source} 中 {word!r} 的逐词模式无效，已忽略")
             continue
 
-        rule: dict[str, str | None] = {"mode": raw_mode.strip().lower()}
-        replacement = raw_rule.get("replacement")
+        mode = raw_mode.strip().lower()
+        rule: dict[str, str | None] = {"mode": mode}
+        valid, replacement = _validate_regex_rule(
+            word,
+            mode,
+            raw_rule.get("replacement"),
+            source,
+        )
+        if not valid:
+            continue
         if replacement is not None:
             if isinstance(replacement, str):
                 rule["replacement"] = replacement
@@ -216,7 +246,7 @@ class Server(BaseModel):
 
 
 class SensitiveWordRuleConfig(BaseModel):
-    """一个敏感词的逐词处理模式覆盖。"""
+    """一个敏感词或正则表达式的处理模式。"""
 
     mode: str
     replacement: str | None = None
@@ -247,7 +277,7 @@ class MCQQConfig(BaseModel):
     """敏感词到替换文本的逐词映射；映射键会自动加入敏感词列表。"""
 
     ignore_word_rules: dict[str, SensitiveWordRuleConfig] = Field(default_factory=dict)
-    """敏感词到处理模式的逐词规则；规则键会自动加入敏感词列表。"""
+    """普通词或正则表达式到处理模式的规则。"""
 
     command_priority: int = 98
     """命令优先级，1-98，消息优先级=命令优先级 - 1"""
@@ -737,14 +767,15 @@ def _merge_sensitive_words(
     replacements = dict(mcqq_config.ignore_word_replacements)
     rules = dict(mcqq_config.ignore_word_rules)
     words.update(replacements)
-    words.update(rules)
 
     if external_words is None:
+        words.update(
+            word for word, rule in rules.items() if rule.mode in VALID_IGNORE_WORD_MODES
+        )
         return words, replacements, rules
 
     words.update(external_words.words)
     words.update(word for word, _replacement in external_words.replacements)
-    words.update(word for word, _mode, _replacement in external_words.rules)
     # setdefault 保证 YAML 中同名映射覆盖 JSON，同时保留两边的声明顺序。
     for word, replacement in external_words.replacements:
         replacements.setdefault(word, replacement)
@@ -753,6 +784,9 @@ def _merge_sensitive_words(
             word,
             SensitiveWordRuleConfig(mode=mode, replacement=replacement),
         )
+    words.update(
+        word for word, rule in rules.items() if rule.mode in VALID_IGNORE_WORD_MODES
+    )
     return words, replacements, rules
 
 
@@ -848,8 +882,12 @@ def _commit_sensitive_words(candidate: _SensitiveWordCandidate) -> None:
     IGNORE_WORD_REPLACEMENTS.update(runtime.replacements)
     _last_valid_external_words = candidate.external_words
 
-    if runtime.words:
-        logger.info(f"加载敏感词成功，敏感词总数为 {len(runtime.words)}")
+    regex_count = len(runtime.regex_filter.patterns)
+    if runtime.words or regex_count:
+        logger.info(
+            "加载敏感词成功，"
+            f"普通词总数为 {len(runtime.words)}，正则规则总数为 {regex_count}"
+        )
     else:
         logger.info("敏感词列表为空，不启用过滤")
 

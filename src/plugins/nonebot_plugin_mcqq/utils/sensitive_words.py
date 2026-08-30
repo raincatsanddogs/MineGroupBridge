@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 import unicodedata
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+
+from nonebot import logger
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Mapping
@@ -53,6 +56,13 @@ class _Match:
     mode: str
     replacement: str
     order: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RegexPattern:
+    pattern: str
+    mode: str
+    compiled: re.Pattern[str]
 
 
 _pinyin_style: Any | None = None
@@ -178,7 +188,9 @@ def _ordered_words(
     ruled_words = [word for word in rules if isinstance(word, str) and word.strip()]
     ruled_word_set = set(ruled_words)
     mapped_words = [
-        word for word in replacements if isinstance(word, str) and word.strip() and word not in ruled_word_set
+        word
+        for word in replacements
+        if isinstance(word, str) and word.strip() and word not in ruled_word_set
     ]
     configured_word_set = ruled_word_set | set(mapped_words)
     plain_words = sorted(
@@ -380,6 +392,102 @@ def _select_matches(matches: list[_Match], source_length: int) -> list[_Match]:
     return sorted(selected, key=lambda match: match.source_start)
 
 
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """按原文位置合并重复或重叠区间，保留相邻的独立命中。"""
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if not merged or start >= merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def _subtract_spans(
+    selected: list[tuple[int, int]],
+    deleted: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """从已选区间中扣除删除区间，返回仍可见的非空片段。"""
+    remaining: list[tuple[int, int]] = []
+    delete_index = 0
+    for selected_start, selected_end in selected:
+        cursor = selected_start
+        while delete_index < len(deleted) and deleted[delete_index][1] <= cursor:
+            delete_index += 1
+
+        current_delete = delete_index
+        while current_delete < len(deleted):
+            delete_start, delete_end = deleted[current_delete]
+            if delete_start >= selected_end:
+                break
+            if delete_start > cursor:
+                remaining.append((cursor, min(delete_start, selected_end)))
+            cursor = max(cursor, delete_end)
+            if cursor >= selected_end:
+                break
+            current_delete += 1
+        if cursor < selected_end:
+            remaining.append((cursor, selected_end))
+    return remaining
+
+
+@dataclass(frozen=True, slots=True)
+class SensitiveRegexFilter:
+    """在普通敏感词处理后执行的不可变正则过滤器。"""
+
+    patterns: tuple[_RegexPattern, ...]
+
+    @classmethod
+    def build(
+        cls,
+        rules: tuple[tuple[str, SensitiveWordRule], ...],
+    ) -> SensitiveRegexFilter:
+        patterns: list[_RegexPattern] = []
+        for pattern, rule in rules:
+            if rule.replacement is not None:
+                logger.warning(
+                    f"敏感词正则规则 {pattern!r} 的 replacement 不生效，已忽略"
+                )
+            try:
+                compiled = re.compile(pattern)
+            except re.error as error:
+                logger.warning(f"敏感词正则规则 {pattern!r} 无效，已忽略：{error}")
+                continue
+            patterns.append(_RegexPattern(pattern, rule.mode, compiled))
+        return cls(tuple(patterns))
+
+    def filter(self, text: str) -> str:
+        if not text or not self.patterns:
+            return text
+
+        selected_spans: list[tuple[int, int]] = []
+        deleted_spans: list[tuple[int, int]] = []
+        for pattern in self.patterns:
+            target = selected_spans if pattern.mode == "regsel" else deleted_spans
+            target.extend(
+                (match.start(), match.end())
+                for match in pattern.compiled.finditer(text)
+                if match.start() != match.end()
+            )
+
+        deleted = _merge_spans(deleted_spans)
+        if selected_spans:
+            selected = _merge_spans(selected_spans)
+            remaining = _subtract_spans(selected, deleted)
+            return " ".join(text[start:end] for start, end in remaining)
+
+        if not deleted:
+            return text
+        pieces: list[str] = []
+        cursor = 0
+        for start, end in deleted:
+            pieces.append(text[cursor:start])
+            cursor = end
+        pieces.append(text[cursor:])
+        return "".join(pieces)
+
+
 @dataclass(frozen=True, slots=True)
 class SensitiveWordFilter:
     """不可变的精确索引与仅初始化一次的拼音索引。"""
@@ -488,6 +596,14 @@ class SensitiveWordRuntimeSnapshot:
     replacements: tuple[tuple[str, str], ...]
     rules: tuple[tuple[str, SensitiveWordRule], ...]
     matcher: SensitiveWordFilter
+    regex_filter: SensitiveRegexFilter
+
+    def filter_plain_text(self, text: str) -> str | None:
+        """先应用普通词规则，再应用纯文本正则规则。"""
+        filtered = self.matcher.filter(text)
+        if filtered is None:
+            return None
+        return self.regex_filter.filter(filtered)
 
 
 def build_sensitive_runtime(  # noqa: PLR0913
@@ -504,25 +620,57 @@ def build_sensitive_runtime(  # noqa: PLR0913
         for word, replacement in replacements.items()
         if isinstance(word, str) and word.strip() and isinstance(replacement, str)
     )
-    valid_rules = tuple(
+    candidate_rules = tuple(
         (word, rule)
         for word, rule in (rules or {}).items()
         if isinstance(word, str)
         and word.strip()
         and isinstance(rule, SensitiveWordRule)
-        and rule.mode in {"block", "replace"}
+        and rule.mode in {"block", "replace", "regdel", "regsel"}
         and (rule.replacement is None or isinstance(rule.replacement, str))
     )
-    valid_words = (
-        frozenset(word for word in words if isinstance(word, str) and word.strip())
-        | frozenset(word for word, _replacement in valid_replacements)
-        | frozenset(word for word, _rule in valid_rules)
+    regex_rule_keys = frozenset(
+        word
+        for word, rule in candidate_rules
+        if rule.mode in {"regdel", "regsel"}
     )
-    replacement_map = dict(valid_replacements)
-    rule_map = dict(valid_rules)
+    regex_filter = SensitiveRegexFilter.build(
+        tuple(
+            (word, rule)
+            for word, rule in candidate_rules
+            if word in regex_rule_keys
+        )
+    )
+    valid_regex_keys = frozenset(pattern.pattern for pattern in regex_filter.patterns)
+    valid_rules = tuple(
+        (word, rule)
+        for word, rule in candidate_rules
+        if word not in regex_rule_keys or word in valid_regex_keys
+    )
+    literal_rules = tuple(
+        (word, rule)
+        for word, rule in valid_rules
+        if rule.mode in {"block", "replace"}
+    )
+    literal_replacements = tuple(
+        (word, replacement)
+        for word, replacement in valid_replacements
+        if word not in regex_rule_keys
+    )
+    valid_words = (
+        frozenset(
+            word
+            for word in words
+            if isinstance(word, str) and word.strip() and word not in regex_rule_keys
+        )
+        | frozenset(word for word, _replacement in literal_replacements)
+        | frozenset(word for word, _rule in literal_rules)
+    )
+    replacement_map = dict(literal_replacements)
+    rule_map = dict(literal_rules)
     return SensitiveWordRuntimeSnapshot(
         words=valid_words,
-        replacements=valid_replacements,
+        replacements=literal_replacements,
         rules=valid_rules,
         matcher=SensitiveWordFilter.build(
             valid_words,
@@ -532,6 +680,7 @@ def build_sensitive_runtime(  # noqa: PLR0913
             rules=rule_map,
             prewarm_phonetic=prewarm_phonetic,
         ),
+        regex_filter=regex_filter,
     )
 
 
@@ -545,6 +694,7 @@ _active_runtime = SensitiveWordRuntimeSnapshot(
         block_only=False,
         phonetic_index=None,
     ),
+    regex_filter=SensitiveRegexFilter(patterns=()),
 )
 
 
@@ -578,9 +728,15 @@ def configure_sensitive_filter(  # noqa: PLR0913
 
 
 def filter_current_sensitive_text(text: str) -> str | None:
-    """使用当前唯一的运行时快照过滤文本。"""
+    """使用当前运行时快照过滤普通词，不执行纯文本正则规则。"""
     runtime = _active_runtime
     return runtime.matcher.filter(text)
+
+
+def filter_current_sensitive_plain_text(text: str) -> str | None:
+    """使用当前运行时快照依次执行普通词和纯文本正则规则。"""
+    runtime = _active_runtime
+    return runtime.filter_plain_text(text)
 
 
 def filter_sensitive_text(  # noqa: PLR0913
@@ -595,16 +751,17 @@ def filter_sensitive_text(  # noqa: PLR0913
     """
     过滤一段即将发往 QQ 的文本。
 
-    最终选中的 block 命中返回 None，否则返回逐词替换后的文本。替换结果
-    不会再次参与匹配，避免自定义替换文本触发递归过滤。
+    最终选中的 block 命中返回 None，否则先完成逐词替换，再应用正则规则。
+    替换结果不会再次参与普通词匹配，但会作为正则规则的输入。
     """
-    return SensitiveWordFilter.build(
+    runtime = build_sensitive_runtime(
         words,
         replacements,
         mode=mode,
         default_replacement=default_replacement,
         rules=rules,
-    ).filter(text)
+    )
+    return runtime.filter_plain_text(text)
 
 
 __all__ = [
@@ -613,6 +770,7 @@ __all__ = [
     "SensitiveWordRuntimeSnapshot",
     "build_sensitive_runtime",
     "configure_sensitive_filter",
+    "filter_current_sensitive_plain_text",
     "filter_current_sensitive_text",
     "filter_sensitive_text",
     "publish_sensitive_runtime",

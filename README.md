@@ -98,14 +98,23 @@ ignore_word_rules:
     replacement: "c"
   "b":
     mode: "block"
+  '\./[^\s<>]+':
+    mode: "regdel"
 ```
 
-规则键和映射键都会自动加入敏感词库。没有逐词规则时继续使用
+普通词规则键和映射键都会自动加入敏感词库。没有逐词规则时继续使用
 `ignore_word_mode`；逐词 `replace` 没有填写 `replacement` 时，依次使用
 `ignore_word_replacements` 中的同词映射和 `ignore_word_replacement`。
 替换模式支持全半角、大小写、跨空白以及带声调的中文同音字匹配；例如“沙”
 和“杀”同为 `sha1`，会采用“杀”的映射，“啥（sha2）”则不会命中。
 多音字按照词组上下文确定读音。
+
+`ignore_word_rules` 还支持仅限逐条配置的 Python 正则模式：`regdel` 删除
+所有完整匹配，`regsel` 在命中时只保留全部完整匹配，并按原文顺序以单个
+空格连接；`regsel` 未命中时不改变消息。正则默认区分大小写，可使用 `(?i)`
+等内联标志。YAML 中建议像上例一样使用单引号，避免反斜杠被 YAML 转义。
+正则规则只处理解析后不含 @ 或富媒体部件的纯文本消息；结构化消息仍只应用
+普通词的 `block` / `replace`。普通词规则先执行，正则规则再处理其结果。
 
 外部 JSON 词库继续使用 `ignore_word_file`，并同时支持普通词、逐词映射和规则：
 
@@ -123,6 +132,9 @@ ignore_word_rules:
     },
     "b": {
       "mode": "block"
+    },
+    "\\./[^\\s<>]+": {
+      "mode": "regsel"
     }
   }
 }

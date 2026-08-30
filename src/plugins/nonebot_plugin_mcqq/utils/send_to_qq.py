@@ -26,7 +26,10 @@ from .parse_mc_msg import (
     parse_mc_message,
     replace_media_names,
 )
-from .sensitive_words import filter_current_sensitive_text
+from .sensitive_words import (
+    filter_current_sensitive_plain_text,
+    filter_current_sensitive_text,
+)
 
 MINUTE_SECONDS = 60.0
 HOUR_SECONDS = 3600.0
@@ -450,6 +453,17 @@ def _filter_message_parts(
     parts: list[MessagePart],
 ) -> tuple[MessagePart, ...] | None:
     """仅过滤最终可见字段；任一 block 命中即屏蔽整个逻辑消息。"""
+    if parts and all(isinstance(part, TextPart) for part in parts):
+        cleaned_text = "".join(
+            clean_minecraft_formatting(part.text)
+            for part in parts
+            if isinstance(part, TextPart)
+        )
+        filtered_text = filter_current_sensitive_plain_text(cleaned_text)
+        if not filtered_text:
+            return None
+        return (TextPart(filtered_text),)
+
     filtered_parts: list[MessagePart] = []
     for part in parts:
         if isinstance(part, TextPart):

@@ -16,6 +16,9 @@ ignore_word_rules:
     replacement: "c"
   "b":
     mode: "block"
+  # regdel 删除正则命中；regsel 命中时只显示所有命中结果。正则建议使用单引号
+  '\./[^\s<>]+':
+    mode: "regdel"
 command_priority: 98
 command_block: true
 notice_connected: false
