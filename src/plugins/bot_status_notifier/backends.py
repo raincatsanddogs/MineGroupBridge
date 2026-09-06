@@ -3,6 +3,7 @@ import contextlib
 import json
 import shutil
 import smtplib
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from email.header import Header
@@ -14,6 +15,26 @@ from typing import Any
 from nonebot import logger
 
 from .config import AgentMailConfig, SMTPConfig
+
+USAGE_CACHE_TTL_SECONDS = 60.0
+
+
+def extract_daily_limit(rate_limits: Any) -> int | None:
+    """从 rate_limits 数据中解析出每日发送上限数字。"""
+    if isinstance(rate_limits, int) and rate_limits > 0:
+        return rate_limits
+    if isinstance(rate_limits, dict):
+        for key in ("daily_send_limit", "daily", "send_limit", "daily_limit"):
+            val = rate_limits.get(key)
+            if isinstance(val, int) and val > 0:
+                return val
+        for sub_val in rate_limits.values():
+            if isinstance(sub_val, dict):
+                limit = sub_val.get("limit") or sub_val.get("max")
+                period = str(sub_val.get("period", "")).lower()
+                if isinstance(limit, int) and (not period or "day" in period):
+                    return limit
+    return None
 
 
 class MailBackend(ABC):
@@ -99,68 +120,25 @@ class SMTPBackend(MailBackend):
 
 
 class AgentMailBackend(MailBackend):
-    """Tencent Agent Mail (agently-cli) 发信实现。"""
+    """Tencent Agent Mail (agently-cli) 发信实现，含云端额度安全拦截与预警。"""
 
     def __init__(self, config: AgentMailConfig) -> None:
         self.config = config
+        self._cached_usage: dict[str, Any] | None = None
+        self._cache_time: float = 0.0
 
-    async def send_mail(self, to: list[str], subject: str, content: str) -> bool:
-        if not to:
-            logger.warning("[BotNotifier] 未指定收件人列表，跳过发送")
-            return False
-
-        cli = self.config.cli_command.strip()
-        resolved_cli = await asyncio.to_thread(shutil.which, cli)
-        cli_exists = await asyncio.to_thread(Path(cli).exists)
-        if not resolved_cli and not cli_exists:
-            logger.warning(
-                f"[BotNotifier] 未在系统 PATH 中找到 '{cli}'，请检查环境或配置文件"
-            )
-            return False
-
-        command: list[str] = [cli, "message", "+send"]
-        for recipient in to:
-            command.extend(["--to", recipient])
-        command.extend([
-            "--subject",
-            subject,
-            "--body",
-            content,
-            "--confirmed",
-        ])
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=30.0
-            )
-        except TimeoutError:
-            logger.error("[BotNotifier] 调用 agently-cli 发信超时 (30s)")
-            return False
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"[BotNotifier] 调用 agently-cli 发生异常: {e}")
-            return False
-        else:
-            if process.returncode == 0:
-                logger.info(
-                    f"[BotNotifier] 已成功通过 agently-cli 向 {to} 发送告警邮件"
-                )
-                return True
-
-            err_msg = stderr.decode("utf-8", errors="replace").strip()
-            out_msg = stdout.decode("utf-8", errors="replace").strip()
-            logger.error(
-                f"[BotNotifier] agently-cli 发信失败 (exit {process.returncode}): "
-                f"{err_msg or out_msg}"
-            )
-            return False
-
-    async def get_quota_usage(self) -> dict[str, Any]:
+    async def get_quota_usage(
+        self, *, force_refresh: bool = False
+    ) -> dict[str, Any]:
         """从腾讯云端查询当前 Agent Mail 账号授权、限制及今日已发信量。"""
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._cached_usage
+            and (now - self._cache_time) < USAGE_CACHE_TTL_SECONDS
+        ):
+            return self._cached_usage
+
         cli = self.config.cli_command.strip()
         resolved_cli = await asyncio.to_thread(shutil.which, cli)
         cli_exists = await asyncio.to_thread(Path(cli).exists)
@@ -239,15 +217,121 @@ class AgentMailBackend(MailBackend):
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[BotNotifier] 查询云端已发邮件箱失败 (可忽略): {e}")
 
-        return {
+        result = {
             "ok": True,
             "email": primary_email,
             "sent_today": sent_today,
             "rate_limits": rate_limits,
         }
+        self._cached_usage = result
+        self._cache_time = now
+        return result
+
+    async def _evaluate_quota_interception(
+        self, content: str
+    ) -> tuple[bool, str]:
+        """检查配额并返回 (是否允许发送, 更新后的正文)。"""
+        usage = await self.get_quota_usage()
+        if not usage.get("ok"):
+            return True, content
+
+        sent_today = int(usage.get("sent_today", 0))
+        detected_limit = extract_daily_limit(usage.get("rate_limits"))
+        effective_limit = (
+            self.config.daily_send_limit
+            if self.config.daily_send_limit > 0
+            else (detected_limit or 0)
+        )
+
+        if effective_limit <= 0:
+            return True, content
+
+        if sent_today >= effective_limit:
+            logger.warning(
+                f"[BotNotifier] 今日云端已发邮件数 ({sent_today}) 已达上限 "
+                f"({effective_limit})，触发安全拦截停止发信，保护账号避免封禁。"
+            )
+            return False, content
+
+        final_content = content
+        if sent_today + 1 >= effective_limit:
+            final_content += (
+                f"\n\n> ⚠️ 【配额预警】此邮件已达今日发送上限"
+                f"（{sent_today + 1}/{effective_limit} 封）。"
+                f"为保护账号配额，今日后续告警将暂停发信，明日 00:00 自动重置。"
+            )
+        elif sent_today >= effective_limit - 2:
+            final_content += (
+                f"\n\n> ⚠️ 【配额提示】今日云端已发 "
+                f"{sent_today + 1}/{effective_limit} 封邮件，即将达到当日上限。"
+            )
+        return True, final_content
+
+    async def send_mail(self, to: list[str], subject: str, content: str) -> bool:
+        if not to:
+            logger.warning("[BotNotifier] 未指定收件人列表，跳过发送")
+            return False
+
+        cli = self.config.cli_command.strip()
+        resolved_cli = await asyncio.to_thread(shutil.which, cli)
+        cli_exists = await asyncio.to_thread(Path(cli).exists)
+        if not resolved_cli and not cli_exists:
+            logger.warning(
+                f"[BotNotifier] 未在系统 PATH 中找到 '{cli}'，请检查环境或配置文件"
+            )
+            return False
+
+        allowed, final_content = await self._evaluate_quota_interception(content)
+        if not allowed:
+            return False
+
+        command: list[str] = [cli, "message", "+send"]
+        for recipient in to:
+            command.extend(["--to", recipient])
+        command.extend([
+            "--subject",
+            subject,
+            "--body",
+            final_content,
+            "--confirmed",
+        ])
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=30.0
+            )
+        except TimeoutError:
+            logger.error("[BotNotifier] 调用 agently-cli 发信超时 (30s)")
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[BotNotifier] 调用 agently-cli 发生异常: {e}")
+            return False
+        else:
+            is_success = process.returncode == 0
+            if is_success:
+                if self._cached_usage and "sent_today" in self._cached_usage:
+                    self._cached_usage["sent_today"] = (
+                        int(self._cached_usage["sent_today"]) + 1
+                    )
+                logger.info(
+                    f"[BotNotifier] 已成功通过 agently-cli 向 {to} 发送告警邮件"
+                )
+            else:
+                err_msg = stderr.decode("utf-8", errors="replace").strip()
+                out_msg = stdout.decode("utf-8", errors="replace").strip()
+                logger.error(
+                    f"[BotNotifier] agently-cli 发信失败 (exit {process.returncode}): "
+                    f"{err_msg or out_msg}"
+                )
+            return is_success
 
     async def check_status(self) -> bool:
-        usage = await self.get_quota_usage()
+        usage = await self.get_quota_usage(force_refresh=True)
         if not usage.get("ok"):
             logger.warning(
                 f"[BotNotifier] Tencent Agent Mail 检查提示: {usage.get('error')}。"

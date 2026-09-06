@@ -76,3 +76,5 @@ smtp:
 agent_mail:
   # agently-cli 命令行名称或完整路径
   cli_command: "agently-cli"
+  # 每日最大发信上限：0 为自动读取云端 rate_limits 限制，大于0则作为固定硬上限进行拦截
+  daily_send_limit: 0

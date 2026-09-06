@@ -21,6 +21,8 @@ class AgentMailConfig(BaseModel):
     """Tencent Agent Mail (agently-cli) 配置参数。"""
 
     cli_command: str = "agently-cli"
+    # 0 为自动读取云端 rate_limits 限制，大于0则作为固定硬上限
+    daily_send_limit: int = 0
 
 
 class NotifierConfig(BaseModel):
