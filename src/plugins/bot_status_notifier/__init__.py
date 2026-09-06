@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 from nonebot import get_driver
@@ -23,9 +24,14 @@ incident_manager = IncidentManager(
     error_threshold=config.error_threshold,
     recovery_threshold=config.recovery_threshold,
     cooldown_seconds=config.cooldown_seconds,
+    flapping_window_seconds=config.flapping_window_seconds,
+    flapping_threshold=config.flapping_threshold,
+    flapping_cooldown_seconds=config.flapping_cooldown_seconds,
+    flapping_stable_seconds=config.flapping_stable_seconds,
 )
 notifier = StatusNotifier(config)
 monitor = BotMonitor(config, incident_manager, notifier)
+_backend_check_task: asyncio.Task[None] | None = None
 
 
 def register_driver_hooks() -> None:
@@ -37,11 +43,17 @@ def register_driver_hooks() -> None:
 
     @driver.on_startup
     async def on_startup() -> None:
+        global _backend_check_task  # noqa: PLW0603
         monitor.start()
+        _backend_check_task = asyncio.create_task(notifier.check_backend_status())
 
     @driver.on_shutdown
     async def on_shutdown() -> None:
+        global _backend_check_task  # noqa: PLW0603
         monitor.stop()
+        if _backend_check_task and not _backend_check_task.done():
+            _backend_check_task.cancel()
+            _backend_check_task = None
 
     @driver.on_bot_connect
     async def on_bot_connect(bot: Bot) -> None:

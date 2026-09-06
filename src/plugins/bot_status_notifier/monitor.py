@@ -24,7 +24,7 @@ def get_adapter_type(bot: Bot) -> str:
 
 
 class BotMonitor:
-    """应用层机器人健康监控器。"""
+    """应用层机器人健康监控器，集成主动心跳与断连防抖合并调度。"""
 
     def __init__(
         self,
@@ -36,6 +36,8 @@ class BotMonitor:
         self.incident_manager = incident_manager
         self.notifier = notifier
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._debounce_task: asyncio.Task[None] | None = None
+        self._pending_disconnects: dict[tuple[str, str], tuple[str, str]] = {}
         self._running = False
 
     def is_monitored_adapter(self, adapter_type: str) -> bool:
@@ -72,9 +74,7 @@ class BotMonitor:
             if should_recover and incident:
                 await self.notifier.send_recovery(incident)
         elif online is False:
-            detail = (
-                f"NapCat 明确报告 QQ 离线 (online=False, good={good})"
-            )
+            detail = f"NapCat 明确报告 QQ 离线 (online=False, good={good})"
             incident, should_alert = self.incident_manager.record_qq_offline(
                 adapter_type, bot_id, detail
             )
@@ -96,7 +96,6 @@ class BotMonitor:
             if adapter_type == "onebot":
                 await self.check_onebot_status(bot)
             else:
-                # 其它非 OneBot 适配器（如 Minecraft）若在活跃连接池中，计入健康计数
                 incident, should_recover = self.incident_manager.record_healthy(
                     adapter_type, str(bot.self_id)
                 )
@@ -104,7 +103,6 @@ class BotMonitor:
                     await self.notifier.send_recovery(incident)
 
     async def _heartbeat_loop(self) -> None:
-        """主动心跳后台轮询循环。"""
         interval = max(5, self.config.check_interval_seconds)
         while self._running:
             try:
@@ -120,9 +118,7 @@ class BotMonitor:
                 break
 
     def start(self) -> None:
-        if not self.config.enabled:
-            return
-        if self._running:
+        if not self.config.enabled or self._running:
             return
         self._running = True
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -136,10 +132,44 @@ class BotMonitor:
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
+            self._debounce_task = None
+        self._pending_disconnects.clear()
         logger.info("[BotNotifier] 监控心跳任务已停止")
 
+    async def _process_disconnect_debounce(self) -> None:
+        """防抖倒计时结束，统一处理待发断连告警。"""
+        delay = max(1, self.config.disconnect_debounce_seconds)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        items = list(self._pending_disconnects.values())
+        self._pending_disconnects.clear()
+
+        if not items:
+            return
+
+        if len(items) == 1:
+            adapter_type, bot_id = items[0]
+            incident, should_alert = self.incident_manager.record_disconnect(
+                adapter_type, bot_id, f"{adapter_type} Bot 连接已断开"
+            )
+            if should_alert:
+                await self.notifier.send_alert(incident)
+        else:
+            incidents = []
+            for adapter_type, bot_id in items:
+                incident, _ = self.incident_manager.record_disconnect(
+                    adapter_type, bot_id, f"{adapter_type} Bot 连接已断开"
+                )
+                incidents.append(incident)
+            await self.notifier.send_batch_disconnect(incidents)
+
     async def on_disconnect(self, bot: Bot) -> None:
-        """处理断开连接事件。"""
+        """处理断开连接事件：暂存防抖队列。"""
         if not self.config.enabled:
             return
         adapter_type = get_adapter_type(bot)
@@ -147,26 +177,32 @@ class BotMonitor:
             return
 
         bot_id = str(bot.self_id)
-        incident, should_alert = self.incident_manager.record_disconnect(
-            adapter_type, bot_id, f"{adapter_type} Bot 连接已断开"
-        )
-        if should_alert:
-            await self.notifier.send_alert(incident)
+        key = (adapter_type, bot_id)
+        self._pending_disconnects[key] = (adapter_type, bot_id)
+
+        if self._debounce_task is None or self._debounce_task.done():
+            self._debounce_task = asyncio.create_task(
+                self._process_disconnect_debounce()
+            )
 
     async def on_connect(self, bot: Bot) -> None:
-        """处理新连接建立事件。"""
+        """处理新连接建立事件：若在防抖队列中则取消待发告警，并核验状态。"""
         if not self.config.enabled:
             return
         adapter_type = get_adapter_type(bot)
         if not self.is_monitored_adapter(adapter_type):
             return
 
-        # 触发一次即时健康校验
+        bot_id = str(bot.self_id)
+        key = (adapter_type, bot_id)
+        # 若在防抖等待期内重新连上，直接取消断开告警
+        self._pending_disconnects.pop(key, None)
+
         if adapter_type == "onebot":
             await self.check_onebot_status(bot)
         else:
             incident, should_recover = self.incident_manager.record_healthy(
-                adapter_type, str(bot.self_id)
+                adapter_type, bot_id
             )
             if should_recover and incident:
                 await self.notifier.send_recovery(incident)

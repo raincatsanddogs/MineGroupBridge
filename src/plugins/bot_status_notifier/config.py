@@ -40,6 +40,13 @@ class NotifierConfig(BaseModel):
         default_factory=lambda: ["onebot", "minecraft", "qq"]
     )
 
+    # 防抖与震荡保护参数
+    disconnect_debounce_seconds: int = 5
+    flapping_window_seconds: int = 3600
+    flapping_threshold: int = 3
+    flapping_cooldown_seconds: int = 1800
+    flapping_stable_seconds: int = 1800
+
     smtp: SMTPConfig = Field(default_factory=SMTPConfig)
     agent_mail: AgentMailConfig = Field(default_factory=AgentMailConfig)
 
