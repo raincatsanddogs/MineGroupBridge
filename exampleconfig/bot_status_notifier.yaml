@@ -1,0 +1,59 @@
+# ===================================================
+# 机器人状态监控与邮件告警配置文件
+# ===================================================
+
+# 是否启用状态监控与邮件告警总开关
+enabled: true
+
+# 接收告警邮件的目标邮箱列表（支持配置多个）
+recipients:
+  - "your_email@example.com"
+
+# ---------------------------------------------------
+# 监控与频控策略
+# ---------------------------------------------------
+
+# 心跳轮询周期（秒）：定时通过 OneBot 的 get_status 接口检测 QQ 在线状态
+check_interval_seconds: 30
+
+# QQ 离线确认阈值：连续几次检测到 online=False 后触发告警（防偶发网络抖动）
+offline_threshold: 2
+
+# 状态接口异常阈值：连续几次调用 get_status 失败/超时后触发告警
+error_threshold: 3
+
+# 恢复正常确认阈值：故障后连续几次检测为在线，才判定恢复并发送恢复通知邮件
+recovery_threshold: 2
+
+# 同一故障事故的冷却间隔（秒）：避免短时间内重复发送大量告警邮件（默认 10 分钟）
+cooldown_seconds: 600
+
+# 当机器人恢复上线后，是否发送恢复正常通知邮件
+send_recovery_notice: true
+
+# 监控的适配器类型列表（包含 onebot, minecraft, qq）
+monitor_adapters:
+  - "onebot"
+  - "minecraft"
+  - "qq"
+
+# ---------------------------------------------------
+# 邮件发送后端设置
+# ---------------------------------------------------
+
+# 发信方式：可选 "smtp"（原生标准协议，零外部依赖）或 "agent_mail"（调用 agently-cli）
+backend: "smtp"
+
+# 当 backend 为 smtp 时的配置
+smtp:
+  host: "smtp.example.com"      # SMTP 服务器地址（如 smtp.qq.com）
+  port: 465                     # SMTP 端口（SSL 通常为 465，STARTTLS 为 587，明文为 25）
+  security: "ssl"               # 加密模式：可选 "ssl"、"starttls" 或 "plain"
+  username: "your_bot@example.com" # 发信账号
+  password: "your_auth_code_or_password" # 邮箱授权码或密码
+  from_name: "MineGroupBridge Monitor" # 发件人显示名称
+
+# 当 backend 为 agent_mail 时的配置（使用腾讯 Agent 原生邮箱）
+agent_mail:
+  # agently-cli 命令行名称或完整路径
+  cli_command: "agently-cli"
