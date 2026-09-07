@@ -44,6 +44,9 @@ monitor_adapters:
 # 断连防抖等待时间（秒）：断开后等待若干秒，若迅速重连则忽略；若多个机器人同时断连则自动合并为一封邮件
 disconnect_debounce_seconds: 5
 
+# 发信前通用宽限期缓冲时间（秒）：任何告警或恢复邮件发出前等待若干秒，若有多个消息相继到达则自动合并为一封邮件发出（默认 5 秒）
+notification_grace_period_seconds: 5
+
 # 频繁震荡统计窗口（秒，默认 1 小时）
 flapping_window_seconds: 3600
 

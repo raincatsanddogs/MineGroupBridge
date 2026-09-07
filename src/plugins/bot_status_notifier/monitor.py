@@ -55,7 +55,7 @@ class BotMonitor:
                 adapter_type, bot_id, f"调用 get_status 失败: {e}"
             )
             if should_alert and incident:
-                await self.notifier.send_alert(incident)
+                await self.notifier.queue_alert(incident)
             return
 
         if not isinstance(result, dict):
@@ -72,14 +72,14 @@ class BotMonitor:
                 adapter_type, bot_id
             )
             if should_recover and incident:
-                await self.notifier.send_recovery(incident)
+                await self.notifier.queue_recovery(incident)
         elif online is False:
             detail = f"NapCat 明确报告 QQ 离线 (online=False, good={good})"
             incident, should_alert = self.incident_manager.record_qq_offline(
                 adapter_type, bot_id, detail
             )
             if should_alert and incident:
-                await self.notifier.send_alert(incident)
+                await self.notifier.queue_alert(incident)
         else:
             logger.debug(
                 f"[BotNotifier] 机器人 {bot_id} online 字段为空或未知 "
@@ -100,7 +100,7 @@ class BotMonitor:
                     adapter_type, str(bot.self_id)
                 )
                 if should_recover and incident:
-                    await self.notifier.send_recovery(incident)
+                    await self.notifier.queue_recovery(incident)
 
     async def _heartbeat_loop(self) -> None:
         interval = max(5, self.config.check_interval_seconds)
@@ -136,6 +136,7 @@ class BotMonitor:
             self._debounce_task.cancel()
             self._debounce_task = None
         self._pending_disconnects.clear()
+        self.notifier.stop()
         logger.info("[BotNotifier] 监控心跳任务已停止")
 
     async def _process_disconnect_debounce(self) -> None:
@@ -158,15 +159,14 @@ class BotMonitor:
                 adapter_type, bot_id, f"{adapter_type} Bot 连接已断开"
             )
             if should_alert:
-                await self.notifier.send_alert(incident)
+                await self.notifier.queue_alert(incident)
         else:
-            incidents = []
             for adapter_type, bot_id in items:
-                incident, _ = self.incident_manager.record_disconnect(
+                incident, should_alert = self.incident_manager.record_disconnect(
                     adapter_type, bot_id, f"{adapter_type} Bot 连接已断开"
                 )
-                incidents.append(incident)
-            await self.notifier.send_batch_disconnect(incidents)
+                if should_alert:
+                    await self.notifier.queue_alert(incident)
 
     async def on_disconnect(self, bot: Bot) -> None:
         """处理断开连接事件：暂存防抖队列。"""
@@ -197,6 +197,7 @@ class BotMonitor:
         key = (adapter_type, bot_id)
         # 若在防抖等待期内重新连上，直接取消断开告警
         self._pending_disconnects.pop(key, None)
+        self.notifier.cancel_pending(adapter_type, bot_id)
 
         if adapter_type == "onebot":
             await self.check_onebot_status(bot)
@@ -205,7 +206,7 @@ class BotMonitor:
                 adapter_type, bot_id
             )
             if should_recover and incident:
-                await self.notifier.send_recovery(incident)
+                await self.notifier.queue_recovery(incident)
 
     async def on_api_called(
         self,
@@ -237,4 +238,4 @@ class BotMonitor:
             adapter_type, bot_id, api, detail
         )
         if should_alert:
-            await self.notifier.send_alert(incident)
+            await self.notifier.queue_alert(incident)

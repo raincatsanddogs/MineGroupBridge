@@ -44,6 +44,7 @@ class NotifierConfig(BaseModel):
 
     # 防抖与震荡保护参数
     disconnect_debounce_seconds: int = 5
+    notification_grace_period_seconds: int = 5
     flapping_window_seconds: int = 3600
     flapping_threshold: int = 3
     flapping_cooldown_seconds: int = 1800
